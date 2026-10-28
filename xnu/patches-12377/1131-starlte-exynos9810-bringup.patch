@@ -1,0 +1,739 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include <stdint.h>
++#include <string.h>
+ #include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/clock.h>
+@@ -11,6 +12,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/arm/protos.h>
+ 
+ 
+ #if HAS_GIC_V3
+@@ -20,6 +22,8 @@
+ #if defined(SWEET)
+ /* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+ SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++static SECURITY_READ_ONLY_LATE(bool) sweet_gic_v2;
++static SECURITY_READ_ONLY_LATE(bool) sweet_psci_hvc;
+ #endif
+ 
+ static vm_offset_t gicd_base;
+@@ -49,6 +53,179 @@
+ #define gicr_read32(offset) (_gic_read32(gicr_pe_base + (offset)))
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
++
++#if defined(SWEET)
++/* GICv2's banked CPU interface, not a GICv3 redistributor. Arm IHI 0048. */
++#define GICV2D_TYPER       0x004
++#define GICV2D_IGROUPR     0x080
++#define GICV2D_ISENABLER   0x100
++#define GICV2D_ICENABLER   0x180
++#define GICV2D_ICPENDR     0x280
++#define GICV2D_IPRIORITYR  0x400
++#define GICV2D_ITARGETSR   0x800
++#define GICV2D_SGIR        0xf00
++#define GICV2D_CPENDSGIR   0xf10
++#define GICV2C_CTLR        0x000
++#define GICV2C_PMR         0x004
++#define GICV2C_BPR         0x008
++#define GICV2C_IAR         0x00c
++#define GICV2C_EOIR        0x010
++#define GICV2C_BYPASS_MASK 0x1e0
++
++static vm_offset_t gicc_base;
++/* GICv2 target bits are implementation-defined, not MPIDR or logical IDs. */
++static uint32_t sweet_gic_cpu_target[SWEET_SMP_MAX_CPUS];
++
++static bool
++sweet_dt_has_string(DTEntry entry, const char *key, const char *want)
++{
++	void const *prop;
++	unsigned int size;
++	if (SecureDTGetProperty(entry, key, &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *p = prop;
++	size_t len = strlen(want) + 1;
++	while (size != 0) {
++		if (size >= len && memcmp(p, want, len) == 0) {
++			return true;
++		}
++		unsigned int n = 0;
++		while (n < size && p[n] != '\0') {
++			n++;
++		}
++		if (n == size) {
++			break;
++		}
++		p += n + 1;
++		size -= n + 1;
++	}
++	return false;
++}
++
++/* SMCCC 1.0: only x0's result is retained; firmware may clobber x1-x17. */
++int32_t
++sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
++{
++	register uint64_t x0 __asm__("x0") = 0xc4000003ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = entry;
++	register uint64_t x3 __asm__("x3") = context;
++	if (sweet_psci_hvc) {
++		__asm__ volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	} else {
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	}
++	return (int32_t)x0;
++}
++
++static void
++sweet_gicv2_init_cpu(void)
++{
++	unsigned int cpu = ml_get_cpu_number_local();
++	uint32_t target = 0;
++	for (unsigned int i = 0; i < 32 && target == 0; i += 4) {
++		target = gicd_read32(GICV2D_ITARGETSR + i);
++		target |= target >> 16;
++		target |= target >> 8;
++		target &= 0xff;
++	}
++	/* ITARGETSR0-7 may be RAZ on a uniprocessor GIC. Self-SGIs use the
++	 * architectural TargetListFilter instead; SMP still needs a real mask. */
++	bool uniprocessor = (gicd_read32(GICV2D_TYPER) & 0xe0) == 0;
++	if (cpu >= SWEET_SMP_MAX_CPUS || (!uniprocessor && target == 0) ||
++	    (target & (target - 1)) != 0) {
++		panic("SWEET GICv2: invalid CPU target cpu=%u mask=0x%x", cpu, target);
++	}
++	/* Quiesce inherited NS PPIs/SGIs. Secure interrupt writes are RAZ/WI. */
++	gicd_write32(GICV2D_ICENABLER, 0xffffffff);
++	gicd_write32(GICV2D_ICPENDR, 0xffffffff);
++	for (unsigned int i = 0; i < 16; i += 4) {
++		gicd_write32(GICV2D_CPENDSGIR + i, 0xffffffff);
++	}
++	/* Two security states: firmware owns Group 0; use Group 1 NS. Without
++	 * the security extension (QEMU virt), Group 0 is our ordinary IRQ group. */
++	gicd_write32(GICV2D_IGROUPR, (gicd_read32(GICV2D_TYPER) & (1U << 10)) ? 0xffffffff : 0);
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICV2D_IPRIORITYR + i, 0xa0a0a0a0);
++	}
++	gicd_write32(GICV2D_ISENABLER, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	_gic_write32(gicc_base + GICV2C_PMR, 0xff);
++	_gic_write32(gicc_base + GICV2C_BPR, 0);
++	/* NS view: bit 0 enables Group 1. EOImodeNS=0: EOIR also deactivates.
++	 * Preserve the firmware's IRQ/FIQ bypass-disable bits, as Linux does. */
++	uint32_t ctlr = _gic_read32(gicc_base + GICV2C_CTLR) & GICV2C_BYPASS_MASK;
++	_gic_write32(gicc_base + GICV2C_CTLR, ctlr | 1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++	__atomic_store_n(&sweet_gic_cpu_target[cpu], target, __ATOMIC_RELEASE);
++	kprintf("SWEET GICv2: cpu=%u target=0x%x ready\n", cpu, target);
++}
++
++uint32_t
++sweet_gic_ack_irq(uint32_t *intid)
++{
++	uint32_t iar;
++	if (sweet_gic_v2) {
++		iar = _gic_read32(gicc_base + GICV2C_IAR);
++		*intid = iar & 0x3ff; /* bits 12:10 are the SGI's source CPU */
++	} else {
++		iar = (uint32_t)__builtin_arm_rsr64("ICC_IAR1_EL1");
++		*intid = iar & 0xffffff;
++	}
++	return iar;
++}
++
++void
++sweet_gic_eoi_irq(uint32_t iar)
++{
++	/* Complete timer/device writes before deactivating a level interrupt. */
++	__builtin_arm_dsb(DSB_SY);
++	if (sweet_gic_v2) {
++		_gic_write32(gicc_base + GICV2C_EOIR, iar); /* retain SGI source bits */
++	} else {
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++	}
++	__builtin_arm_isb(ISB_SY);
++}
++
++void
++sweet_gic_send_ipi(unsigned int logical, uint64_t mpidr)
++{
++	if (sweet_gic_v2) {
++		if (logical >= SWEET_SMP_MAX_CPUS) {
++			panic("SWEET GICv2: invalid SGI target %u", logical);
++		}
++		if (logical == ml_get_cpu_number_local()) {
++			__builtin_arm_dsb(DSB_ISHST);
++			gicd_write32(GICV2D_SGIR, (2U << 24) | SWEET_IPI_SGI);
++			__builtin_arm_isb(ISB_SY);
++			return;
++		}
++		uint32_t target = __atomic_load_n(&sweet_gic_cpu_target[logical], __ATOMIC_ACQUIRE);
++		if (target == 0) {
++			panic("SWEET GICv2: cpu=%u has no target mask", logical);
++		}
++		__builtin_arm_dsb(DSB_ISHST);
++		gicd_write32(GICV2D_SGIR, (target << 16) | SWEET_IPI_SGI);
++	} else {
++		unsigned int aff0 = mpidr & 0xff;
++		if (aff0 >= 16) {
++			panic("SWEET GICv3: SGI target requires unsupported range selector");
++		}
++		uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
++		    (((mpidr >> 16) & 0xff) << 32) | (((mpidr >> 8) & 0xff) << 16) |
++		    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
++		__builtin_arm_dsb(DSB_ISHST);
++		__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	}
++	__builtin_arm_isb(ISB_SY);
++}
++#endif /* SWEET */
+ 
+ static vm_offset_t
+ find_gicr_pe_base()
+@@ -104,6 +281,18 @@
+ 
+ #if defined(SWEET)
+ 		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
++		sweet_gic_v2 = sweet_dt_has_string(entry, "compatible", "arm,cortex-a15-gic") ||
++		    sweet_dt_has_string(entry, "compatible", "arm,cortex-a9-gic");
++		if (!sweet_gic_v2 && !sweet_dt_has_string(entry, "compatible", "arm,gic-v3")) {
++			panic("SWEET GIC: unsupported controller compatible");
++		}
++		DTEntry psci;
++		if (SecureDTLookupEntry(NULL, "/psci", &psci) == kSuccess) {
++			sweet_psci_hvc = sweet_dt_has_string(psci, "method", "hvc");
++			if (!sweet_psci_hvc && !sweet_dt_has_string(psci, "method", "smc")) {
++				panic("SWEET PSCI: expected method smc or hvc");
++			}
++		}
+ 		void const *timer_prop;
+ 		unsigned int timer_size;
+ 		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
+@@ -116,7 +305,8 @@
+ 			}
+ 			sweet_vtimer_intid = intid;
+ 		}
+-		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
++		kprintf("SWEET GIC: v%u virtual timer INTID %u, PSCI %s\n",
++		    sweet_gic_v2 ? 2 : 3, sweet_vtimer_intid, sweet_psci_hvc ? "hvc" : "smc");
+ #endif
+ 
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+@@ -133,15 +323,44 @@
+ 			panic("%s: cannot map GICD region", __func__);
+ 		}
+ 
+-		// Find GICR base address
+-		gicr_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
+-
+-		if (!gicr_base) {
+-			panic("%s: cannot map GICR region", __func__);
+-		}
+-
+-		gicr_size = gicr_size_prop;
+-	}
++#if defined(SWEET)
++		if (sweet_gic_v2) {
++			if (gicd_size_prop < 0x1000 || gicr_size_prop < 0x1000) {
++				panic("SWEET GICv2: GICD/GICC regions too small");
++			}
++			gicc_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
++			if (!gicc_base) {
++				panic("SWEET GICv2: cannot map GICC region");
++			}
++			/* Once, on the boot CPU. Leave all NS SPIs disabled until drivers own them. */
++			gicd_write32(GICD_CTLR, 0);
++			unsigned int lines = 32 * ((gicd_read32(GICV2D_TYPER) & 0x1f) + 1);
++			for (unsigned int i = 32; i < lines; i += 32) {
++				gicd_write32(GICV2D_ICENABLER + i / 8, 0xffffffff);
++				gicd_write32(GICV2D_ICPENDR + i / 8, 0xffffffff);
++			}
++			gicd_write32(GICD_CTLR, 1); /* GICv2 has no ARE or RWP bits */
++			__builtin_arm_dsb(DSB_SY);
++		} else
++#endif
++		{
++			// Find GICR base address
++			gicr_base = ml_io_map(soc_base_phys + gicr_base_prop, gicr_size_prop);
++
++			if (!gicr_base) {
++				panic("%s: cannot map GICR region", __func__);
++			}
++
++			gicr_size = gicr_size_prop;
++		}
++	}
++
++#if defined(SWEET)
++	if (sweet_gic_v2) {
++		sweet_gicv2_init_cpu();
++		return; /* Never touch GICR or ICC_* on GICv2. */
++	}
++#endif
+ 
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -39,6 +39,10 @@
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++uint32_t sweet_gic_ack_irq(uint32_t *intid);
++void sweet_gic_eoi_irq(uint32_t iar);
++void sweet_gic_send_ipi(unsigned int logical, uint64_t mpidr);
++int32_t sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,7 +1,7 @@
+ /*
+- * A55 SMP bring-up for sweet using XNU's legacy IOCPU interface and PSCI.
++ * Generic ARM SMP bring-up using XNU's legacy IOCPU interface and PSCI.
+  * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ * CPU_OFF and suspend still require board-specific platform work.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -27,20 +28,6 @@
+ /* Secondaries must not be booted before the boot CPU is registered and booted. */
+ static SweetCPU *sweet_pending[MAX_CPUS];
+ static uint32_t sweet_boot_registered;
+-
+-/* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+-static int32_t
+-sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+-{
+-	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
+-	register uint64_t x1 __asm__("x1") = target;
+-	register uint64_t x2 __asm__("x2") = entry;
+-	register uint64_t x3 __asm__("x3") = context;
+-	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+-	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+-	    "x14", "x15", "x16", "x17", "cc", "memory");
+-	return (int32_t)x0;
+-}
+ 
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+@@ -79,8 +66,8 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* XNU's reset lookup uses Aff1:Aff0. Exynos uses both, Qualcomm Aff1. */
++	if ((cpu->phys_id & ~(MPIDR_AFF1_MASK | MPIDR_AFF0_MASK)) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -88,7 +75,7 @@
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("ARMv8 CPU");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -179,7 +166,7 @@
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
++	/* Supplied ADTs put MPIDR 0 first; power-domain ordering is board-specific. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
+@@ -249,19 +236,7 @@
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
+-	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+-	uint64_t mpidr = topology->cpus[logical].phys_id;
+-	unsigned int aff0 = mpidr & 0xff;
+-	if (aff0 >= 16) {
+-		panic("SWEET CPU: SGI target requires unsupported range selector");
+-	}
+-	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+-	    (((mpidr >> 16) & 0xff) << 32) |
+-	    (((mpidr >> 8) & 0xff) << 16) |
+-	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+-	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+-	__builtin_arm_isb(ISB_SY);
++	sweet_gic_send_ipi(logical, topology->cpus[logical].phys_id);
+ }
+ 
+ kern_return_t
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,13 +38,13 @@
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = ('xiaomi,sweet', 'samsung,starlte');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = ('qcom,kryo470', 'bergamota,arm-cpu');"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -316,11 +316,16 @@
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++	/* ID_AA64PFR0.GIC==0 on GICv2 cores: ICC_SRE_EL2 would be UNDEFINED. */
++	mrs		x1, ID_AA64PFR0_EL1
++	ubfx	x1, x1, #24, #4
++	cbz		x1, Lsweet_secondary_no_gic_sysregs
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++Lsweet_secondary_no_gic_sysregs:
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -526,10 +531,19 @@
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	ldr		x0, [x20, BA_VIDEO_BASE]
++	cbz		x0, Lsweet_mark_done
++	ldr		x3, [x20, BA_VIDEO_WIDTH]
++	cmp		x3, #64
++	b.lo	Lsweet_mark_done
++	ldr		x2, [x20, BA_VIDEO_HEIGHT]
++	cmp		x2, #32
++	b.ls	Lsweet_mark_done
++	ldr		x4, [x20, BA_VIDEO_ROWBYTES]
++	sub		x2, x2, #32
++	madd	x0, x2, x4, x0
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -541,6 +555,7 @@
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++Lsweet_mark_done:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -691,19 +706,36 @@
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+-	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+-	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+-	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+-	 */
+-	MOV64	x10, 0x9c000000
++	 * Boot framebuffer: one 32MB Normal-NC block in the existing V=P L2
++	 * table. The current boards' framebuffer and RAM (including Exynos's
++	 * upper bank) share L1 index 0, whose table must not be replaced.
++	 * Look up the table instead of assuming a fixed framebuffer address.
++	 */
++	ldr		x10, [x20, BA_VIDEO_BASE]
++	cbz		x10, Lsweet_fb_map_done
++	and		x10, x10, #(ARM_TTE_BLOCK_L2_MASK)
++	and		x12, x10, #(ARM_TT_L1_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L1_SHIFT)
++	ldr		x13, [x25, x12, lsl #TTE_SHIFT]
++	/* A framebuffer in another L1 region needs one additional L2 page. */
++	tbnz	x13, #0, Lsweet_fb_l2_found
++	add		x2, x2, #PGBYTES
++	mov		x13, x2
++	mov		x11, #(TTE_PGENTRIES)
++Lsweet_fb_l2_clear:
++	str		xzr, [x13], #(1 << TTE_SHIFT)
++	subs	x11, x11, #1
++	b.ne	Lsweet_fb_l2_clear
++	create_l1_table_entry x10, x25, x2, x6, x7, x8
++	mov		x13, x2
++Lsweet_fb_l2_found:
++	and		x13, x13, #(ARM_TTE_TABLE_MASK)
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+-	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++Lsweet_fb_map_done:
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -368,6 +368,12 @@
+ 	DECLARE("BA_MEM_SIZE", offsetof(struct boot_args, memSize));
+ 	DECLARE("BA_TOP_OF_KERNEL_DATA", offsetof(struct boot_args, topOfKernelData));
+ 	DECLARE("BA_BOOT_FLAGS", offsetof(struct boot_args, bootFlags));
++#if defined(SWEET)
++	DECLARE("BA_VIDEO_BASE", offsetof(struct boot_args, Video.v_baseAddr));
++	DECLARE("BA_VIDEO_ROWBYTES", offsetof(struct boot_args, Video.v_rowBytes));
++	DECLARE("BA_VIDEO_WIDTH", offsetof(struct boot_args, Video.v_width));
++	DECLARE("BA_VIDEO_HEIGHT", offsetof(struct boot_args, Video.v_height));
++#endif
+ 
+ #if XNU_MONITOR
+ 	DECLARE("PMAP_CPU_DATA_INFLIGHT_PMAP", offsetof(struct pmap_cpu_data, inflight_pmap));
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,5 +1,5 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
++ * Boot framebuffer console. No allocation, locks, ADT parsing or
+  * per-CPU state: panic() can reach this before a current thread exists.
+  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+  * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+@@ -13,15 +13,13 @@
+ #include <pexpert/pexpert.h>
+ 
+ /*
+- * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
+- * splash framebuffer of both boards (sweet 0x9c000000 1080x2400, Poco F1
+- * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
++ * start.s and arm_vm_init map the 32MB block containing Boot_Video.
++ * The full scanout must fit this block (sweet, beryllium and starlte do).
+  */
+-#define EARLY_BLOCK_PA 0x9c000000ull
+ #define EARLY_BLOCK_SIZE 0x2000000ull
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+-static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+-static uint64_t early_off;
++static volatile uint32_t *early_fb;
++static unsigned int early_width, early_height, early_stride;
++static uint64_t early_off, early_block_pa;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH early_width
+ #define EARLY_HEIGHT early_height
+@@ -61,6 +59,9 @@
+ static void
+ sweet_early_draw(char c)
+ {
++	if (early_fb == NULL) {
++		return;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -122,10 +123,10 @@
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	if (early_screen) {
++	if (early_screen && early_fb != NULL) {
+ 		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++			for (unsigned int x = stage * 48; x < (stage + 1) * 48 && x < EARLY_WIDTH; x++) {
+ 				EARLY_FB[y * EARLY_STRIDE + x] = color;
+ 			}
+ 		}
+@@ -200,20 +201,36 @@
+ void
+ sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+-	if (pa < EARLY_BLOCK_PA || width == 0 || height <= 32 || rowbytes < width * 4 ||
+-	    pa + height * rowbytes > EARLY_BLOCK_PA + EARLY_BLOCK_SIZE) {
+-		return; /* keep the sweet default */
+-	}
+-	early_off = pa - EARLY_BLOCK_PA;
++	early_fb = NULL;
++	early_block_pa = 0;
++	if (pa == 0 || (pa & 3) || width < EARLY_CELL_W || width > 4096 ||
++	    height < 32 + EARLY_CELL_H || height > 8192 || (rowbytes & 3) ||
++	    rowbytes > 16384 || rowbytes < width * 4) {
++		return;
++	}
++	early_off = pa & (EARLY_BLOCK_SIZE - 1);
++	if (height * rowbytes > EARLY_BLOCK_SIZE - early_off) {
++		return;
++	}
++	early_block_pa = pa - early_off;
+ 	early_width = (unsigned int)width;
+ 	early_height = (unsigned int)height;
+ 	early_stride = (unsigned int)(rowbytes / 4);
+ 	early_fb = (volatile uint32_t *)(uintptr_t)pa; /* bootstrap V=P */
+ }
+ 
++uint64_t
++sweet_early_framebuffer_block(void)
++{
++	return early_block_pa;
++}
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
++	if (early_fb == NULL) {
++		return;
++	}
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_fb = (volatile uint32_t *)(uintptr_t)(base + early_off);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -12,6 +12,7 @@
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes);
++uint64_t sweet_early_framebuffer_block(void);
+ void sweet_early_disable(void);
+ void sweet_early_set_cmdline(const char *cmdline);
+ void sweet_early_flush_log(void);
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1831,6 +1831,10 @@
+ static void
+ sweet_early_map_final(void)
+ {
++	const uint64_t pa = sweet_early_framebuffer_block();
++	if (pa == 0) {
++		return;
++	}
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
+ 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+@@ -1838,7 +1842,7 @@
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3173,8 +3173,8 @@
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t intid;
++	uint32_t iar = sweet_gic_ack_irq(&intid);
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -3185,12 +3185,11 @@
+ 		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		ml_interrupt_masked_debug_end();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		sweet_gic_eoi_irq(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
++		sweet_gic_eoi_irq(iar);
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+@@ -3200,7 +3199,7 @@
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		sweet_gic_eoi_irq(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -1,8 +1,9 @@
+ /*
+- * SWEET kernels run on two Xiaomi phones. The ADT root compatible
++ * SWEET kernels select hardware through the ADT root compatible
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   samsung,starlte  Galaxy S9, Exynos9810 (bring-up)
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -67,6 +68,16 @@
+ }
+ 
+ static inline bool
++sweet_board_qualcomm(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = (sweet_board_is("xiaomi,sweet") || sweet_board_is("xiaomi,beryllium")) ? 1 : 0;
++	}
++	return cached == 1;
++}
++
++static inline bool
+ sweet_board_beryllium(void)
+ {
+ 	static int cached = -1;
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -98,6 +98,9 @@
+ int
+ sweet_spmi_init(void)
+ {
++	if (!sweet_board_qualcomm()) {
++		return -1;
++	}
+ 	int rc;
+ 	while (__atomic_exchange_n(&sp_init_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		delay(10);

@@ -2,6 +2,7 @@
 # Build Enxerto (the bootloader) and wrap it in an Android boot.img that ABL accepts.
 #   BOARD=sweet (default)  boot.img v2 mirroring the stock PixelOS header, DTB in the header
 #   BOARD=beryllium        boot.img v1, Image.gz + appended DTB like the Poco F1 ROM (SDM845 ABL)
+#   BOARD=starlte          raw ARM64 Image + optional payload, Samsung handoff bring-up (docs/STARLTE.md)
 # Usage: [BOARD=..] [DTB=..] ./build.sh [payload.bin]
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -20,19 +21,26 @@ NM=${CROSS}nm
 # -fno-tree-switch-conversion -fno-jump-tables: gcc turns switches (and if/else chains) that pick between pointers into
 # tables of pointers, which need ABS64 relocations (refused below).
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -fno-tree-switch-conversion -fno-jump-tables -Wall -Wextra"
+# The payload format always has 608 command-line bytes; XNU26 boot_args has 1024.
+# starlte defaults to 1024 in loader.c. Existing boards may opt in for XNU26 here.
+[ -z "${BOOT_ARGS_LINE_LENGTH:-}" ] || CFLAGS="$CFLAGS -DBOOT_ARGS_LINE_LENGTH=$BOOT_ARGS_LINE_LENGTH"
 [ "${BOOTLOG:-0}" = 0 ] || CFLAGS="$CFLAGS -DBOOTUI_LOG=1"
 # CHARGER=0 compiles the early fast charging out (charger.c, README); default on. Runtime: boot.img cmdline
 # bergamota.charger=0 (off) / =keep (leave the programmed ICL/FCC in place at the kernel hand-off).
 [ "${CHARGER:-1}" != 0 ] || CFLAGS="$CFLAGS -DENXERTO_CHARGER=0"
 # BOOTPAUSE=<ms>: wait that long before jumping to xnu (debug photos of the log).
 [ -z "${BOOTPAUSE:-}" ] || CFLAGS="$CFLAGS -DBOOT_PAUSE_MS=${BOOTPAUSE}"
+OUT=out
 case $BOARD in
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;
+starlte)	CFLAGS="$CFLAGS -DBOARD_STARLTE"; OUT=out/starlte ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
-[ -f "$DTB" ] || { echo "error: $DTB missing (stock DTB of the phone, see README)" >&2; exit 1; }
-mkdir -p out
+if [ "$BOARD" != starlte ]; then
+	[ -f "$DTB" ] || { echo "error: $DTB missing (stock DTB of the phone, see README)" >&2; exit 1; }
+fi
+mkdir -p "$OUT"
 # Bergamota fastboot (docs/BERGAMOTA_FASTBOOT.md): runs by itself when there is no payload; BERGAMOTA=1
 # forces it even with a payload in the ramdisk (boot.img cmdline flag), BERGAMOTA=0 keeps the old
 # diagnostics/loader path.
@@ -42,21 +50,31 @@ case ${BERGAMOTA:-} in
 0) CMDLINE="$CMDLINE bergamota.fastboot=0" ;;
 esac
 SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
+if [ "$BOARD" = starlte ]; then
+	SRCS="start.S starlte.c console.c artdraw.c bootui.c mmu.c fdt.c loader.c inflate.c"
+fi
 OBJS=""
+COBJS=""
 for f in $SRCS; do
-	$CC $CFLAGS -c $f -o out/${f%.*}.o
-	OBJS="$OBJS out/${f%.*}.o"
+	$CC $CFLAGS -c $f -o "$OUT/${f%.*}.o"
+	OBJS="$OBJS $OUT/${f%.*}.o"
+	[ "$f" = start.S ] || COBJS="$COBJS $OUT/${f%.*}.o"
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$($READELF -r ${OBJS//out\/start.o/} | grep -c ABS64 || true)
+abs=$($READELF -r $COBJS | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T enxerto.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	$OBJS -o out/enxerto.elf -lgcc
-$OBJCOPY -O binary out/enxerto.elf out/Image
+	$OBJS -o "$OUT/enxerto.elf" -lgcc
+$OBJCOPY -O binary "$OUT/enxerto.elf" "$OUT/Image"
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$($NM out/enxerto.elf | awk '$3=="_end"{print $1}')
-python3 -c "import sys; open(sys.argv[1],'r+b').truncate(int(sys.argv[2],16))" out/Image "$size"
+size=$($NM "$OUT/enxerto.elf" | awk '$3=="_end"{print $1}')
+python3 -c "import sys; open(sys.argv[1],'r+b').truncate(int(sys.argv[2],16))" "$OUT/Image" "$size"
+if [ "$BOARD" = starlte ]; then
+	[ -z "${1:-}" ] || cp "$1" "$OUT/payload.bin"
+	echo "Built $OUT/Image (raw ARM64 Image; Samsung handoff instructions in docs/STARLTE.md)"
+	exit 0
+fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then

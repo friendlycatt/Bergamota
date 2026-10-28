@@ -88,3 +88,14 @@ backboardd, lockdownd, PosterBoard running, SSH on 192.168.7.2.
 * Identity: `tools/mkadt.py --identity n104ap` (needs `research/ios26/n104ap.adt`); the kernel reads hw.model/hw.machine from the ADT
   root, so patch 0059 needs no change.
 * Renegade root for the 26.7.1 OTA (`tools/renegade`), then first boot.
+
+## 4. Galaxy S9 / Exynos9810 follow-up (2026-10-29)
+
+Patch **1131** adds initial `starlte` support under `MACHINE_CONFIG=SWEET`:
+runtime GICv2/v3, ADT-selected PSCI, Aff1:Aff0 CPU validation, platform/CPU
+personalities and boot-video-derived framebuffer mappings. The ordered
+series reconstructs cleanly and component checks pass on Linux/QEMU;
+a full kernel build containing 1131 and an S9 device boot remain pending.
+Explicitly use `macos_version=26.5` when dispatching CI on `develop`.
+Hardware provenance, exact results and remaining work:
+[`STARLTE.md`](STARLTE.md), [integration checks](../tools/starlte-check/README.md).

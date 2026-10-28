@@ -32,6 +32,8 @@ The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPho
 > [!WARNING]
 > This is an experimental bring-up, not a usable phone OS. It installs into `userdata` and **erases Android's user data**. Apple's security model is mostly switched off, so do not put anything personal on it.
 
+**Galaxy S9 / iOS 26 bring-up:** the Exynos9810 `starlte` target now has early platform support and passing loader, interrupt and reset component checks. Full-kernel and S9 device boots are pending. See [`docs/STARLTE.md`](docs/STARLTE.md) for hardware references and status, and [`tools/starlte-check`](tools/starlte-check) for the Linux/QEMU checks. The installation guide below describes the Poco F1.
+
 ## The boot chain
 
 ```
@@ -230,6 +232,8 @@ It does this for every Mach-O in the root and for all of the dyld shared cache. 
 | `apps/Bergamota/` | Bergamota, the SwiftUI control plane, plus its CLI (`scripts/bergamota`) |
 | `enxerto/` | Enxerto, the bare-metal bootloader (C + asm): loader, inflate, UFS, USB/DWC3, fastboot, PMIC, boot UI |
 | `xnu/patches-11215/` | Heartwood, the XNU patch series (xnu-11215), applied in order by `.github/workflows/xnu.yml`; `xnu/patches/` is the older xnu-8796 series |
+| `xnu/patches-12377/` | iOS 26 kernel series; patch 1131 adds initial starlte support. Build with `macos_version=26.5` |
+| `tools/starlte-check/` | Linux/QEMU checks for interrupts, Enxerto loading, real-header compilation, reset assembly and framebuffer mappings |
 | `tools/renegade/` | Renegade: `pacstrip*`, `fips_rehmac`, root build, HFS+ and sparse-image tools, `dsctools` (shared-cache symbolication) |
 | `tools/adt-gpufw.py`, `zap-split.py` | GPU firmware into the ADT (`/sweet-gpu`); split a squashed `.mbn` into `.mdt` + `.bNN` |
 | `tools/bergamota-flash.py` | Delta/full flashing of userdata, boot and logo through Bergamota fastboot |

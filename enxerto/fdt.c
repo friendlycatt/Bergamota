@@ -144,20 +144,32 @@ static void copy_str(char *d, const char *s, int max)
 	d[i] = 0;
 }
 
-/* qcom DTs use #address-cells = #size-cells = 2 at the root and in /reserved-memory. */
-static void print_regs(const char *label, uintptr_t val, uint32_t len)
+static uint64_t read_cells(uintptr_t val, uint32_t cells)
 {
-	for (uint32_t o = 0; o + 16 <= len; o += 16) {
-		uint64_t a = (uint64_t)be32(val + o) << 32 | be32(val + o + 4);
-		uint64_t s = (uint64_t)be32(val + o + 8) << 32 | be32(val + o + 12);
+	uint64_t n = 0;
+	for (uint32_t i = 0; i < cells; i++) n = (n << 32) | be32(val + i * 4);
+	return n;
+}
+
+/* The immediate parent's cell counts describe reg (Samsung commonly uses 2/1). */
+static void print_regs(const char *label, uintptr_t val, uint32_t len, uint32_t ac, uint32_t sc)
+{
+	if (ac < 1 || ac > 2 || sc > 2 || len % (4 * (ac + sc))) {
+		con_str(label, "invalid reg/cell sizes");
+		return;
+	}
+	uint32_t step = 4 * (ac + sc);
+	for (uint32_t o = 0; o < len; o += step) {
+		uint64_t a = read_cells(val + o, ac);
+		uint64_t s = read_cells(val + o + 4 * ac, sc);
 		char buf[40];
 		static const char hex[] = "0123456789ABCDEF";
 		int n = 0;
-		for (int i = 32; i >= 0; i -= 4)
+		for (int i = 60; i >= 0; i -= 4)
 			buf[n++] = hex[(a >> i) & 0xf];
 		buf[n++] = ' ';
 		buf[n++] = '+';
-		for (int i = 32; i >= 0; i -= 4)
+		for (int i = 60; i >= 0; i -= 4)
 			buf[n++] = hex[(s >> i) & 0xf];
 		buf[n] = 0;
 		con_str(label, buf);
@@ -174,6 +186,7 @@ void fdt_board_info(uintptr_t fdt)
 	uintptr_t strings = fdt + be32(fdt + 12);
 	int depth = 0, in_mem = 0, in_resv = 0, in_chosen = 0;
 	char cur[12] = "";
+	uint32_t address_cells[16], size_cells[16];
 
 	for (;;) {
 		uint32_t tok = be32(p);
@@ -181,6 +194,13 @@ void fdt_board_info(uintptr_t fdt)
 		switch (tok) {
 		case FDT_BEGIN_NODE: {
 			const char *name = (const char *)p;
+			if (depth >= 16) {
+				con_str("FDT", "tree nesting too deep");
+				return;
+			}
+			/* DTSpec defaults; cell counts are not inherited. */
+			address_cells[depth] = 2;
+			size_cells[depth] = 1;
 			depth++;
 			if (depth == 2) {
 				in_mem = starts(name, "memory");
@@ -193,6 +213,7 @@ void fdt_board_info(uintptr_t fdt)
 			break;
 		}
 		case FDT_END_NODE:
+			if (depth == 0) return;
 			depth--;
 			if (depth < 2)
 				in_mem = in_resv = in_chosen = 0;
@@ -201,14 +222,18 @@ void fdt_board_info(uintptr_t fdt)
 			uint32_t len = be32(p), nameoff = be32(p + 4);
 			uintptr_t val = p + 8;
 			const char *pn = (const char *)(strings + nameoff);
-			if (depth == 1 && streq(pn, "model")) {
+			if (depth > 0 && len == 4 && streq(pn, "#address-cells")) {
+				address_cells[depth - 1] = be32(val);
+			} else if (depth > 0 && len == 4 && streq(pn, "#size-cells")) {
+				size_cells[depth - 1] = be32(val);
+			} else if (depth == 1 && streq(pn, "model")) {
 				char buf[48];
 				copy_str(buf, (const char *)val, sizeof buf);
 				con_str("MODEL", buf);
 			} else if (depth == 2 && in_mem && streq(pn, "reg")) {
-				print_regs("MEMORY", val, len);
+				print_regs("MEMORY", val, len, address_cells[depth - 2], size_cells[depth - 2]);
 			} else if (depth == 3 && in_resv && streq(pn, "reg")) {
-				print_regs(cur, val, len);
+				print_regs(cur, val, len, address_cells[depth - 2], size_cells[depth - 2]);
 			} else if (depth == 2 && in_chosen && streq(pn, "bootargs")) {
 				/* "msm_drm.dsi_display0=dsi_..._display:" names the panel */
 				const char *s = (const char *)val;

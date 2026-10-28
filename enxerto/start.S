@@ -20,6 +20,9 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
+#if defined(BOARD_STARLTE)
+	bl	starlte_enter_el1
+#endif
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
@@ -43,6 +46,9 @@ _start:
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
+#if defined(BOARD_STARLTE)
+	bl	starlte_enter_el1
+#endif
 	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x0, lsl #12
@@ -54,6 +60,45 @@ secondary_entry:
 	bl	secondary_main
 4:	wfe
 	b	4b
+
+#if defined(BOARD_STARLTE)
+/* Accept a Linux-style EL1 or bare EL2 handoff. No resident EL2 hypervisor. */
+starlte_enter_el1:
+	mrs	x1, CurrentEL
+	cmp	x1, #4
+	b.eq	5f
+	cmp	x1, #8
+	b.ne	6f
+	mov	x1, #(1 << 31)
+	msr	hcr_el2, x1
+	msr	vttbr_el2, xzr
+	msr	cptr_el2, xzr
+	msr	mdcr_el2, xzr
+	mov	x1, #3
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	/* The GIC sysreg interface is optional; never probe it on GICv2 cores. */
+	mrs	x1, id_aa64pfr0_el1
+	ubfx	x1, x1, #24, #4
+	cbz	x1, 7f
+	mrs	x1, icc_sre_el2
+	orr	x1, x1, #1
+	orr	x1, x1, #8
+	msr	icc_sre_el2, x1
+7:
+	mov	x1, #0x0800
+	movk	x1, #0x30d0, lsl #16
+	msr	sctlr_el1, x1
+	msr	elr_el2, x30
+	mov	x1, #0x3c5
+	msr	spsr_el2, x1
+	eret
+5:
+	ret
+6:
+	wfe
+	b	6b
+#endif
 
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number

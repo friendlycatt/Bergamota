@@ -12,3 +12,25 @@ BOARD=beryllium enxerto/build.sh [payload.bin]   # -> enxerto/out/enxerto-boot.i
 ```
 
 `build.sh` also runs the host tests: it renders every screen to `out/preview/` and checks the fastboot state machine. Images built before the rename are called `shim/out/shim-boot-*.img`, and Bergamota still lists them.
+
+## Galaxy S9 (starlte)
+
+The Samsung target selects `starlte.c` with the common framebuffer, FDT,
+MMU and payload loader. It currently produces a raw ARM64 Image:
+
+```sh
+BOARD=starlte enxerto/build.sh                   # -> enxerto/out/starlte/{Image,enxerto.elf}
+python3 tools/starlte-check/enxerto.py --qemu    # 12 host cases + 4 complete Image handoffs
+```
+
+An optional absolute payload path passed to `build.sh` is copied to
+`enxerto/out/starlte/payload.bin`. Samsung USB/fastboot, storage, charging
+and boot-image packaging remain pending. The implemented entry accepts a
+Linux-style FDT/initrd handoff at EL1 or bare EL2; the actual S9 handoff and
+inherited display need verification. See [`docs/STARLTE.md`](../docs/STARLTE.md)
+and the [integration-check README](../tools/starlte-check/README.md).
+
+Starlte defaults to the XNU26 boot_args ABI (1024-byte CommandLine).
+Sweet/beryllium keep the legacy 608-byte default; set
+`BOOT_ARGS_LINE_LENGTH=1024` when building them for XNU26. The SWEETXNU
+payload command-line field remains 608 bytes in both payload versions.

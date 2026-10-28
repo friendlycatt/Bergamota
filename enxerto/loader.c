@@ -21,7 +21,17 @@
 #include "loader.h"
 #include "mmu.h"
 
-#define BOOT_LINE_LENGTH	608
+#define PAYLOAD_LINE_LENGTH	608
+#ifndef BOOT_ARGS_LINE_LENGTH
+#if defined(BOARD_STARLTE)
+#define BOOT_ARGS_LINE_LENGTH	1024
+#else
+#define BOOT_ARGS_LINE_LENGTH	608
+#endif
+#endif
+#if BOOT_ARGS_LINE_LENGTH != 608 && BOOT_ARGS_LINE_LENGTH != 1024
+#error unsupported boot_args CommandLine length
+#endif
 #define PAGE_16K		0x4000UL
 
 /*
@@ -39,7 +49,7 @@ struct payload {
 	uint32_t version, nsegs;
 	uint64_t virt_base, entry_va, adt_off, adt_size, kernel_end;
 	uint64_t phys_base, mem_size;
-	char cmdline[BOOT_LINE_LENGTH];
+	char cmdline[PAYLOAD_LINE_LENGTH];
 	uint8_t segs[];		/* nsegs x (32 bytes v1, 40 bytes v2) */
 };
 
@@ -55,7 +65,7 @@ struct boot_args {
 	uint32_t machineType;
 	uint64_t deviceTreeP;
 	uint32_t deviceTreeLength;
-	char CommandLine[BOOT_LINE_LENGTH];
+	char CommandLine[BOOT_ARGS_LINE_LENGTH];
 	uint64_t bootFlags, memSizeActual;
 };
 
@@ -63,22 +73,41 @@ _Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload heade
 _Static_assert(sizeof(struct payload_seg) == 40, "payload segment layout");
 _Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
 _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+_Static_assert(sizeof(struct boot_args) == 128 + BOOT_ARGS_LINE_LENGTH, "boot_args layout");
+_Static_assert(__builtin_offsetof(struct boot_args, memSizeActual) == 120 + BOOT_ARGS_LINE_LENGTH, "boot_args tail");
 
-/* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
+/* Use aligned words where possible, even if MMU setup failed (Device memory).
+ * Byte tails must neither read payload padding nor write past a segment/ADT.
+ */
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)
 {
-	volatile uint64_t *d = (volatile uint64_t *)dst;
-	volatile const uint64_t *s = (volatile const uint64_t *)src;
-	for (uint64_t i = 0; i < (n + 7) / 8; i++)
-		d[i] = s[i];
+	if (!((dst | src) & 7)) {
+		while (n >= 8) {
+			*(volatile uint64_t *)dst = *(volatile const uint64_t *)src;
+			dst += 8;
+			src += 8;
+			n -= 8;
+		}
+	}
+	while (n--) {
+		*(volatile uint8_t *)dst++ = *(volatile const uint8_t *)src++;
+	}
 }
 
 static void zero64(uintptr_t dst, uint64_t n)
 {
-	volatile uint64_t *d = (volatile uint64_t *)dst;
-	for (uint64_t i = 0; i < n / 8; i++)
-		d[i] = 0;
+	while (n && (dst & 7)) {
+		*(volatile uint8_t *)dst++ = 0;
+		n--;
+	}
+	while (n >= 8) {
+		*(volatile uint64_t *)dst = 0;
+		dst += 8;
+		n -= 8;
+	}
+	while (n--) {
+		*(volatile uint8_t *)dst++ = 0;
+	}
 }
 
 static int magic_ok(const char *m)
@@ -156,7 +185,7 @@ int loader_has_payload(uintptr_t dtb)
 	uint64_t rd_start, rd_end;
 
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || rd_end < rd_start + 8)
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || rd_end < rd_start || rd_end - rd_start < 8)
 		return 0;
 	return magic_ok((const char *)rd_start);
 }
@@ -168,17 +197,17 @@ const char *loader_boot(uintptr_t dtb)
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
-	return loader_boot_payload(rd_start, rd_end, 0);
+	return loader_boot_payload(rd_start, rd_end, 1);
 }
 
 /*
  * Boot the payload in [rd_start, rd_end) (ABL ramdisk or the fastboot download); returns only on error.
- * verify: run loader_check() first (always for downloads; the ABL ramdisk path keeps its old trust).
+ * verify: run loader_check() first (used by both downloads and the FDT-initrd path).
  */
 const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify)
 {
 	const struct payload *p = (const struct payload *)rd_start;
-	if (rd_end < rd_start + 8 || !magic_ok(p->magic))
+	if (rd_end < rd_start || rd_end - rd_start < 8 || !magic_ok(p->magic))
 		return "no SWEETXNU payload";
 	/* A real payload: switch to the branded boot screen (con_* output becomes its log window). */
 	bootui_init();
@@ -244,7 +273,7 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 		infl_base += raw;
 		bootui_mib("INFLATE", infl_base >> 20, infl_total >> 20, PM_MMU, PM_INFLATE_END);
 		if (s->vmsize > raw)
-			zero64(dst + ((raw + 7) & ~7UL), s->vmsize - ((raw + 7) & ~7UL));
+			zero64(dst + raw, s->vmsize - raw);
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 	bootui_progress(920, "SEGMENTS READY");
@@ -273,7 +302,7 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
+	for (int i = 0; i < PAYLOAD_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
@@ -282,7 +311,9 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
 	bootui_progress(1000, "STARTING IOS");
+#if !defined(BOARD_STARLTE)
 	enxerto_charger_handoff();	/* the kernel's sweetcharger=2 finds the charger registers as ABL left them */
+#endif
 	con_str("XNU", "jumping (fbcon clears screen)");
 	bootui_handoff();
 

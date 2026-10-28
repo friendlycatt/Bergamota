@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Boot a SWEETXNU payload (tools/mkpayload.py) in QEMU's virt board.
 
-  qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--gdb] [--live-serial]
+  qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--gic-version 2|3] [--cpus N]
 
 Does what enxerto/loader.c does on the phone, but on the host: places the
 kernel segments, ADT and boot_args at their physical addresses and starts
 the CPU at a 6-instruction stub that jumps to the entry with x0 = boot_args.
-virt RAM starts at 0x40000000; with 4G it covers the phone's framebuffer
-(0x9c000000) and the kernel's phys_base (0xb0000000) as plain memory.
+GIC version, CPU count and framebuffer geometry come from a --qemu ADT.
+Both SWEETXNU payload versions (plain / raw DEFLATE) are supported.
+boot_args uses XNU 26's 1024-byte CommandLine; older kernels can select 608.
 
 After N seconds (or when the guest stops) it writes into OUTDIR:
-  fb.png     the 1080x2400 framebuffer (what the phone screen would show)
+  fb.png     the ADT-described framebuffer
   regs.txt   QEMU's view of CPU state
   qemu.log   exceptions with ESR/FAR/ELR (-d int,guest_errors)
 
@@ -21,12 +22,112 @@ returns 2 when a panic is visible; absence of a panic does not prove boot.
 An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
+from typing import NamedTuple
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
-FB_STRIDE = FB_W * 4
+import adt
+
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
-BOOT_LINE_LENGTH = 608
+PAYLOAD_LINE_LENGTH = 608
+
+
+class Framebuffer(NamedTuple):
+    base: int
+    width: int
+    height: int
+    stride: int
+
+    @property
+    def size(self):
+        return self.stride * self.height
+
+
+def payload_header(payload):
+    if len(payload) < 0x2a8:
+        raise ValueError('payload header truncated')
+    magic, version, count = struct.unpack_from('<8sII', payload)
+    if magic != b'SWEETXNU' or version not in (1, 2):
+        raise ValueError('not a SWEETXNU v1/v2 payload')
+    stride = 40 if version == 2 else 32
+    if not 1 <= count <= 64 or 0x2a8 + count * stride > len(payload):
+        raise ValueError('bad payload segment table')
+    values = struct.unpack_from('<7Q', payload, 0x10)
+    _, _, offset, size, _, _, _ = values
+    if offset < 0x2a8 + count * stride or offset + size > len(payload):
+        raise ValueError('ADT outside payload')
+    return version, count, values
+
+
+def payload_segments(payload):
+    version, count, _ = payload_header(payload)
+    stride = 40 if version == 2 else 32
+    for i in range(count):
+        fields = struct.unpack_from('<5Q' if version == 2 else '<4Q', payload, 0x2a8 + stride * i)
+        va, size, offset, file_size = fields[:4]
+        raw_size = fields[4] if version == 2 else 0
+        if offset + file_size > len(payload) or (raw_size or file_size) > size:
+            raise ValueError(f'segment {i} outside payload or larger than vmsize')
+        data = payload[offset:offset + file_size]
+        if raw_size:
+            decoder = zlib.decompressobj(-15)
+            data = decoder.decompress(data, raw_size + 1)
+            if len(data) != raw_size or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+                raise ValueError(f'segment {i} has invalid raw DEFLATE data/size')
+        yield va, size, data
+
+
+def payload_tree(payload):
+    _, _, (_, _, offset, size, _, _, _) = payload_header(payload)
+    tree, end = adt.parse(payload[offset:offset + size])
+    if end != size:
+        raise ValueError('ADT size mismatch')
+    return tree
+
+
+def tree_node(tree, path):
+    node = tree
+    for part in path.strip('/').split('/'):
+        node = next((c for c in node.children if c.name == part), None)
+        if node is None:
+            raise ValueError(f'ADT missing {path}')
+    return node
+
+
+def framebuffer(payload):
+    node = tree_node(payload_tree(payload), '/sweet-fbcon')
+    base, reserved = struct.unpack('<2Q', node.prop('reg'))
+    width, height, stride = (struct.unpack('<I', node.prop(key))[0] for key in ('width', 'height', 'stride'))
+    fb = Framebuffer(base, width, height, stride)
+    if not base or width <= 0 or height <= 0 or stride % 4 or stride < width * 4 or fb.size > reserved:
+        raise ValueError('invalid ADT framebuffer geometry')
+    return fb
+
+
+def qemu_config(payload):
+    """Reject hardware ADTs rather than silently running with the wrong MMIO/CPUs."""
+    tree = payload_tree(payload)
+    io = tree_node(tree, '/arm-io')
+    gic = tree_node(tree, '/arm-io/gic')
+    compat = gic.prop('compatible').split(b'\0')
+    if b'arm,cortex-a15-gic' in compat or b'arm,cortex-a9-gic' in compat:
+        version, cpu_base = 2, 0x08010000
+    elif b'arm,gic-v3' in compat:
+        version, cpu_base = 3, 0x080a0000
+    else:
+        raise ValueError('unsupported ADT interrupt controller')
+    bus, soc, _ = struct.unpack('<3Q', io.prop('ranges'))
+    dist, _, interface, _ = struct.unpack('<4Q', gic.prop('reg'))
+    if bus or dist + soc != 0x08000000 or interface + soc != cpu_base:
+        raise ValueError('GIC addresses are not QEMU virt; regenerate ADT with --qemu')
+    if gic.prop('virtual-timer-intid') != struct.pack('<I', 27):
+        raise ValueError('QEMU requires virtual timer INTID 27')
+    if tree_node(tree, '/psci').prop('method') != b'hvc\0':
+        raise ValueError('QEMU virt requires PSCI HVC')
+    cpus = tree_node(tree, '/cpus').children
+    ids = [struct.unpack('<I', c.prop('reg'))[0] for c in cpus]
+    if not 1 <= len(ids) <= 8 or ids != list(range(len(ids))):
+        raise ValueError('QEMU requires contiguous MPIDRs; regenerate ADT with --qemu --qemu-cpus N')
+    return version, len(ids)
 
 
 def check_qemu_dependency(cpu='cortex-a76'):
@@ -74,27 +175,41 @@ def check_kernel_tools(kernel_path):
     return True
 
 
-def build_image(payload):
+def build_image(payload, boot_args_line_length=1024):
     """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
-    magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
-    assert magic == b'SWEETXNU' and ver == 1, 'not a SWEETXNU v1 payload'
-    virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
-        struct.unpack_from('<7Q', payload, 0x10)
-    cmdline = payload[0x48:0x48 + BOOT_LINE_LENGTH]
+    _, _, (virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size) = payload_header(payload)
+    if boot_args_line_length not in (608, 1024):
+        raise ValueError('boot_args command-line length must be 608 or 1024')
+    cmdline = payload[0x48:0x48 + PAYLOAD_LINE_LENGTH]
+    if b'\0' not in cmdline:
+        raise ValueError('payload command line is not NUL terminated')
+    fb = framebuffer(payload)
     delta = phys_base - virt_base
     adt_pa = kernel_end + delta
     ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
     top = ba_pa + PAGE
+    if not mem_size or phys_base >= adt_pa or top > phys_base + mem_size:
+        raise ValueError('kernel/ADT/boot_args outside RAM')
+    if phys_base < fb.base + fb.size and fb.base < phys_base + mem_size:
+        raise ValueError('framebuffer overlaps kernel-managed RAM')
     img = bytearray(top - phys_base)
-    for i in range(nsegs):
-        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
-        o = vmaddr + delta - phys_base
-        img[o:o + fsize] = payload[foff:foff + fsize]
+    spans, entry_found = [], False
+    for vmaddr, vmsize, data in payload_segments(payload):
+        o = vmaddr - virt_base
+        if o < 0 or vmaddr + vmsize > kernel_end:
+            raise ValueError('segment outside kernel RAM')
+        if any(o < end and start < o + vmsize for start, end in spans):
+            raise ValueError('overlapping payload segments')
+        spans.append((o, o + vmsize))
+        entry_found |= vmaddr <= entry_va < vmaddr + len(data)
+        img[o:o + len(data)] = data
+    if not entry_found:
+        raise ValueError('entry point outside initialized segments')
     img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
     ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
-                     FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
-    ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
-    assert len(ba) == 736
+                     fb.base, 1, fb.stride, fb.width, fb.height, 32, 0, adt_pa - delta, adt_size)
+    ba += cmdline.ljust(boot_args_line_length, b'\0') + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
+    assert len(ba) == 128 + boot_args_line_length
     img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
     return phys_base, bytes(img), ba_pa, entry_va + delta
 
@@ -104,40 +219,38 @@ def stub(ba_pa, entry_pa):
     return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
 
 
-def write_png(path, raw):
+def write_png(path, raw, fb):
     rows = []
-    for y in range(FB_H):
-        line = raw[y * FB_STRIDE:(y + 1) * FB_STRIDE]
-        rgb = bytearray(FB_W * 3)	# a8r8g8b8 little endian = B G R A in memory
+    for y in range(fb.height):
+        line = raw[y * fb.stride:y * fb.stride + fb.width * 4]
+        rgb = bytearray(fb.width * 3)	# a8r8g8b8 little endian = B G R A in memory
         rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
         rows.append(b'\0' + bytes(rgb))
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
-    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
+    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', fb.width, fb.height, 8, 2, 0, 0, 0))
     png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
     open(path, 'wb').write(png)
 
 
 def payload_data(payload, va, size):
     """Read initialized segment bytes by VA (the payload has no slide)."""
-    nsegs = struct.unpack_from('<I', payload, 12)[0]
-    for i in range(nsegs):
-        vmaddr, _, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
-        if vmaddr <= va and va + size <= vmaddr + fsize:
-            offset = foff + va - vmaddr
-            return payload[offset:offset + size]
+    for vmaddr, _, data in payload_segments(payload):
+        if vmaddr <= va and va + size <= vmaddr + len(data):
+            offset = va - vmaddr
+            return data[offset:offset + size]
     raise ValueError(f'VA {va:#x}+{size:#x} not in initialized payload segments')
 
 
-def decode_screen(raw, font):
+def decode_screen(raw, font, fb):
     """Exact glyph matching for pe_serial.c's 2x, white-on-black fbcon."""
     glyphs = {font[c * 16:(c + 1) * 16]: chr(c) for c in range(32, 127)}
     rows, unknown = [], 0
-    for row in range(FB_H // 32):
+    for row in range(fb.height // 32):
         chars = []
-        for col in range(FB_W // 16):
+        for col in range(fb.width // 16):
             glyph = bytearray(16)
             for y in range(16):
-                offset = (row * 32 + y * 2) * FB_STRIDE + col * 16 * 4
+                offset = (row * 32 + y * 2) * fb.stride + col * 16 * 4
                 for x in range(8):
                     if raw[offset + x * 8:offset + x * 8 + 4] == b'\xff' * 4:
                         glyph[y] |= 1 << x
@@ -161,7 +274,7 @@ def screen_result(screen, unknown):
     return {'status': status, 'unknown_glyphs': unknown, 'snapshot_only': True}
 
 
-def qmp(sock_path, *cmds, pmemsave=None):
+def qmp(sock_path, *cmds, pmemsave=None, cpu_index=None):
     """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket)."""
     s = socket.socket(socket.AF_UNIX)
     s.connect(sock_path)
@@ -179,7 +292,12 @@ def qmp(sock_path, *cmds, pmemsave=None):
     call('qmp_capabilities')
     out = []
     for c in cmds:
-        r = call('human-monitor-command', **{'command-line': c})
+        args = {'command-line': c}
+        # QMP resets HMP's selected CPU for each command. `cpu N` followed by
+        # `info registers` therefore still reads CPU0; pass the QMP selector.
+        if cpu_index is not None:
+            args['cpu-index'] = cpu_index
+        r = call('human-monitor-command', **args)
         if 'error' in r:
             print(f'qmp {c!r}: {r["error"]}', file=sys.stderr)
         out.append(r.get('return', ''))
@@ -224,6 +342,10 @@ def main():
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
+    ap.add_argument('--gic-version', type=int, choices=(2, 3), help='must match the ADT (default: infer)')
+    ap.add_argument('--cpus', type=int, choices=range(1, 9), help='must match the ADT (default: infer)')
+    ap.add_argument('--boot-args-line-length', type=int, choices=(608, 1024), default=1024,
+                    help='kernel boot_args ABI: 1024 for XNU26 (default), 608 for XNU8796')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
@@ -251,6 +373,18 @@ def main():
         return 1
 
     payload = open(a.payload, 'rb').read()
+    try:
+        gic_version, cpus = qemu_config(payload)
+        if a.gic_version is not None and a.gic_version != gic_version:
+            raise ValueError('--gic-version differs from the payload ADT')
+        if a.cpus is not None and a.cpus != cpus:
+            raise ValueError('--cpus differs from the payload ADT')
+        fb = framebuffer(payload)
+        phys_base, img, ba_pa, entry_pa = build_image(payload, a.boot_args_line_length)
+        if phys_base < STUB_PA + PAGE:
+            raise ValueError('kernel RAM overlaps the QEMU boot stub/DTB')
+    except (ValueError, TypeError, struct.error, zlib.error) as e:
+        ap.error(str(e))
     font = None
     if a.kernel:
         symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
@@ -262,7 +396,6 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
@@ -272,8 +405,9 @@ def main():
         os.unlink(mon)
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
-    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    ram_end = max(phys_base + mem_size, fb.base + fb.size)
+    ram_gib = max(4, -(-(ram_end - 0x40000000) // (1 << 30)))
+    cmd = ['qemu-system-aarch64', '-M', f'virt,gic-version={gic_version}', '-cpu', a.cpu, '-smp', str(cpus), '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
@@ -281,6 +415,7 @@ def main():
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
+    open(f'{out}/command.json', 'w').write(json.dumps(cmd, indent=2) + '\n')
 
     p = None
     serial_file = f'{out}/serial.txt'
@@ -304,21 +439,29 @@ def main():
 
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
         if p.poll() is None:
-            _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
-            open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
+            commands = ['stop', 'info cpus']
+            replies = qmp(mon, *commands)
+            snapshots = [f'\n(qemu) {c}\n{r}' for c, r in zip(commands, replies)]
+            for cpu in range(cpus):
+                regs = qmp(mon, 'info registers', cpu_index=cpu)[0]
+                snapshots.append(f'\n(qemu cpu {cpu}) info registers\n{regs}')
+            replies = qmp(mon, *a.hmp, pmemsave=(fb.base, fb.size, f'{out}/fb.raw'))
+            snapshots += [f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, replies)]
+            open(f'{out}/regs.txt', 'w').write(''.join(snapshots))
             p.kill()
             p.wait()
             raw = open(f'{out}/fb.raw', 'rb').read()
-            write_png(f'{out}/fb.png', raw)
+            write_png(f'{out}/fb.png', raw, fb)
             result = {'status': 'not_decoded'}
             if font is not None:
-                screen, unknown = decode_screen(raw, font)
+                screen, unknown = decode_screen(raw, font, fb)
                 open(f'{out}/fb.txt', 'w').write(screen)
                 result = screen_result(screen, unknown)
             os.unlink(f'{out}/fb.raw')
         else:
             print(f'qemu exited early: {p.returncode}', file=sys.stderr)
 
+        result.update(gic_version=gic_version, cpus=cpus, framebuffer=fb._asdict())
         open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result), file=sys.stderr)
         print(f'{out}/fb.png  {out}/regs.txt  {out}/qemu.log', file=sys.stderr)
@@ -337,6 +480,9 @@ def main():
             p.wait()
         return 130
     finally:
+        if p and p.poll() is None:
+            p.kill()
+            p.wait()
         ram_file = f'{out}/ram.bin'
         if os.path.exists(ram_file):
             try:

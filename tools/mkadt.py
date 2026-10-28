@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
-Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board sweet|beryllium] [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+Only what the early boot path actually reads (see NOTES.md).
+Usage: mkadt.py OUT.adt [--board sweet|beryllium|starlte] [--identity n104ap]
+       [--qemu] [--gic-version 2|3] [--qemu-cpus N] [--highmem] [--dump]
+       [--display-scale 3|2] [--points WxH] [--lowpool BASE:SIZE]
+Source references for Exynos9810: docs/STARLTE.md.
 """
-import hashlib, os, struct, sys
+import argparse, hashlib, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -31,6 +34,7 @@ TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
+QEMU_GICC = 0x08010000
 QEMU_VTIMER_INTID = 27
 
 # Per-board differences; GIC, UFS, timer and the SoC window are the same on
@@ -70,6 +74,25 @@ BOARDS = {
         # /arm-io/bluetooth for bluetoothd/BlueTool (docs/BT_IOS_TRANSPORT.md 3.2). Sweet has no
         # Bluetooth driver: the node is beryllium only.
         bluetooth=True),
+    'starlte': dict(
+        # Galaxy S9 (SM-G960F), NOT the Snapdragon S9 or the S9+.
+        # Samsung's DT describes the GIC/CPUs/timer. Mu-Silicium supplies the
+        # framebuffer reservation (MemoryMapLib.c) and geometry (starlte.dsc).
+        # Its Resources/DTBs/starlte.dts supplies the upper DDR bank.
+        # Pinned sources and live-validation gaps: docs/STARLTE.md.
+        fb=(0xcc000000, 0x1043000), fb_wh=(1440, 2960),
+        compat=['samsung,starlte', 'samsung,exynos9810'],
+        cpu_compat=('arm,ananke', 'arm,meerkat'), big_from=4,
+        # Nominal metadata, not measured clocks: LITTLE table entry and the
+        # supplied Samsung kernel's big-core policy-max / boot QoS (kHz * 1000).
+        freqs=(1794000000, 1924000000),
+        mpidrs=(0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103),
+        # Candidate upper bank; confirm RAM/reservations on the live S9.
+        mem=(0x880000000, 0x80000000), highmem=(0x880000000, 0x80000000),
+        # QEMU's low RAM must end before the source-derived scanout at 0xcc000000.
+        qemu_mem=(0x50000000, 0x60000000),
+        gic_version=2, gic=(0x10101000, 0x1000, 0x10102000, 0x1000),
+        timebase=26000000, vtimer_intid=27, ufs=False),
 }
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
@@ -153,16 +176,30 @@ def bluetooth_node(ph):
 
 
 def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, points=(375, 812), lowpool=None,
-          identity='d22ap'):
+          identity='d22ap', gic_version=None, qemu_cpus=1):
+    """qemu=True selects virt MMIO, timer and CPU affinities (not S9 hardware)."""
     ident = IDENTITIES[identity]
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     b = BOARDS[board]
+    version = b.get('gic_version', 3) if gic_version is None else gic_version
+    if version not in (2, 3):
+        raise ValueError('GIC version must be 2 or 3')
+    if not qemu and version != b.get('gic_version', 3):
+        raise ValueError('--gic-version can only override the controller with --qemu')
+    if not 1 <= qemu_cpus <= 8 or (not qemu and qemu_cpus != 1):
+        raise ValueError('--qemu-cpus requires --qemu and a count from 1 to 8')
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
-    if board != 'sweet' and not qemu:
-        if not highmem:
-            phys_base, mem_size = b['mem']
+    if not qemu:
+        phys_base, mem_size = b.get('highmem' if highmem else 'mem', (phys_base, mem_size))
+    elif not highmem:
+        phys_base, mem_size = b.get('qemu_mem', (phys_base, mem_size))
     fb, fb_size = b['fb']
     fb_w, fb_h = b['fb_wh']
+    # Some existing reservations extend beyond the actual scanout. XNU maps
+    # the pixels, so check that extent rather than the reservation's padding.
+    if fb_w * fb_h * 4 > fb_size:
+        raise ValueError('framebuffer does not fit its reservation')
+    if phys_base < fb + fb_w * fb_h * 4 and fb < phys_base + mem_size:
+        raise ValueError('framebuffer overlaps kernel-managed RAM')
     if lowpool is not None:
         lp_base, lp_size = lowpool
         if board != 'beryllium' or qemu:
@@ -171,7 +208,13 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x}: must be 16K aligned inside {LOWPOOL_MIN:#x}..{LOWPOOL_MAX:#x}')
         if lp_base < phys_base + mem_size and phys_base < lp_base + lp_size:
             raise SystemExit(f'--lowpool {lp_base:#x}:{lp_size:#x} overlaps the kernel RAM {phys_base:#x}+{mem_size:#x}')
-    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    if qemu:
+        gicd, gicd_size = QEMU_GICD, 0x1000 if version == 2 else GICD_SIZE
+        gic_cpu, gic_cpu_size = (QEMU_GICC, 0x2000) if version == 2 else (QEMU_GICR, GICR_SIZE)
+        timebase, vtimer = QEMU_TIMEBASE, QEMU_VTIMER_INTID
+    else:
+        gicd, gicd_size, gic_cpu, gic_cpu_size = b.get('gic', (GICD, GICD_SIZE, GICR, GICR_SIZE))
+        timebase, vtimer = b.get('timebase', TIMEBASE), b.get('vtimer_intid', VTIMER_INTID)
     # 256 bytes: xnu-12377 asks the bootloader for 4 * SHA-512 (prng_random.c, panics "Expected 256 seed bytes from
     # bootloader, but got 64"); older kernels copy only the 64 they ask for (PE_get_random_seed clamps)
     seed = seed if seed is not None else os.urandom(256)
@@ -224,25 +267,32 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (sweet: 0-5 Cortex-A55,
-    # 6-7 Cortex-A76; beryllium: 0-3 A55, 4-7 A75), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # Physical affinities are independent of XNU's logical IDs. Keep one SMP
+    # scheduler cluster for now; this does not describe Exynos power domains.
+    # XNU defaults to one CPU; cpus=N opts into an initial prefix of this tree.
+    mpidrs = tuple(range(qemu_cpus)) if qemu else b.get('mpidrs', tuple(core << 8 for core in range(8)))
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core, mpidr in enumerate(mpidrs):
+        cpu_compat = b['cpu_compat']
+        if isinstance(cpu_compat, tuple):
+            cpu_compat = cpu_compat[core >= b['big_from']]
+        if board == 'starlte':
+            cpu_compat = cstr(cpu_compat) + cstr('bergamota,arm-cpu')
+        else:
+            # Existing SweetCPU personality, including the beryllium alias.
+            cpu_compat = cstr(cpu_compat) + (cstr('qcom,kryo470') if cpu_compat != 'qcom,kryo470' else b'')
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            # SweetCPU matches IONameMatch 'qcom,kryo470': keep it after the real core name
-            ('compatible', cstr(b['cpu_compat']) + (cstr('qcom,kryo470') if b['cpu_compat'] != 'qcom,kryo470' else b'') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cpu_compat + cstr('ARM,v8')),
+            ('reg', u32(mpidr)),     # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
-            ('l3-cache-id', u32(0)),     # shared L3
+            ('l2-cache-id', u32(core)),  # scheduler metadata: per-core L2
+            ('l3-cache-id', u32(0)),     # scheduler metadata: shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
             ('clock-frequency', u32(b['freqs'][core >= b['big_from']])),
@@ -256,10 +306,11 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
 
     gic = node('gic', [
         ph(),
-        ('compatible', cstr('arm,gic-v3')),
+        ('compatible', cstr('arm,cortex-a15-gic' if version == 2 else 'arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
-        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+        ('virtual-timer-intid', u32(vtimer)),
+        # Second region is GICC for v2, GICR for v3. Never probe ICC_* on v2.
+        ('reg', u64(gicd - SOC_BASE, gicd_size, gic_cpu - SOC_BASE, gic_cpu_size)),
     ])
     arm_io = node('arm-io', [
         ph(),
@@ -332,7 +383,7 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
 
     # Identity of the iPhone whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP / N104AP), model is hw.machine/hw.product
-    # (iPhone10,3 / iPhone12,1). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # (iPhone10,3 / iPhone12,1). Hardware compatible strings select the platform expert.
     return node('device-tree', [
         ph(),
         ('compatible', cstr(ident['target']) + cstr(ident['machine']) + b''.join(cstr(c) for c in b['compat']) + cstr('AppleARM')),
@@ -342,19 +393,37 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product +
+        ([] if qemu or not b.get('ufs', True) else [ufs]) +
+        # QEMU virt exposes PSCI through HVC; Samsung and Qualcomm use SMC.
+        ([node('psci', [('method', cstr('hvc' if qemu else 'smc'))])] if qemu or board == 'starlte' else []))
 
 
 if __name__ == '__main__':
-    board = sys.argv[sys.argv.index('--board') + 1] if '--board' in sys.argv else 'sweet'
-    scale = int(sys.argv[sys.argv.index('--display-scale') + 1]) if '--display-scale' in sys.argv else 3
-    points = tuple(int(v) for v in sys.argv[sys.argv.index('--points') + 1].split('x')) if '--points' in sys.argv else (375, 812)
-    lowpool = parse_lowpool(sys.argv[sys.argv.index('--lowpool') + 1]) if '--lowpool' in sys.argv else None
-    identity = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22ap'
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, board=board, display_scale=scale, points=points,
-                 lowpool=lowpool, identity=identity)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('out')
+    ap.add_argument('--board', choices=BOARDS, default='sweet')
+    ap.add_argument('--identity', choices=IDENTITIES, default='d22ap')
+    ap.add_argument('--qemu', action='store_true')
+    ap.add_argument('--qemu-cpus', type=int, default=1)
+    ap.add_argument('--gic-version', type=int, choices=(2, 3))
+    ap.add_argument('--highmem', action='store_true')
+    ap.add_argument('--display-scale', type=int, choices=(2, 3), default=3)
+    ap.add_argument('--points', default='375x812')
+    ap.add_argument('--lowpool', type=parse_lowpool)
+    ap.add_argument('--dump', action='store_true')
+    a = ap.parse_args()
+    try:
+        points = tuple(int(v) for v in a.points.split('x'))
+        if len(points) != 2 or min(points) <= 0:
+            raise ValueError('--points must be positive WIDTHxHEIGHT')
+        root = build(qemu=a.qemu, highmem=a.highmem, board=a.board, display_scale=a.display_scale,
+                     points=points, lowpool=a.lowpool, identity=a.identity, gic_version=a.gic_version,
+                     qemu_cpus=a.qemu_cpus)
+    except ValueError as e:
+        ap.error(str(e))
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(a.out, 'wb').write(blob)
+    if a.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{a.out}: {len(blob)} bytes', file=sys.stderr)

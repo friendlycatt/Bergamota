@@ -1,10 +1,18 @@
 #pragma once
 /*
- * Board selection: build.sh passes -DBOARD_BERYLLIUM for the Poco F1
- * (xiaomi beryllium, SDM845); the default is sweet (SM7150).
- * Every value comes from the board's mainline/downstream device tree.
+ * Board selection: build.sh passes BOARD_BERYLLIUM or BOARD_STARLTE;
+ * the default is sweet (SM7150). starlte provenance: docs/STARLTE.md.
+ * Constants come from board device trees and firmware-port references.
  */
-#if defined(BOARD_BERYLLIUM)
+#if defined(BOARD_STARLTE)
+#define BOARD_NAME		"starlte"
+/* Mu-Silicium MemoryMapLib.c + starlte.dsc; confirm the live scanout. */
+#define FB_BASE			0xcc000000UL
+#define FB_W			1440
+#define FB_H			2960
+#define GICD_BASE		0x10101000UL
+#define GICC_BASE		0x10102000UL
+#elif defined(BOARD_BERYLLIUM)
 #define BOARD_NAME		"beryllium"
 /* reserved-memory cont_splash_mem@9d400000, simple-framebuffer 1080x2246 */
 #define FB_BASE			0x9d400000UL
@@ -26,8 +34,10 @@
 #define FB_PHYS			FB_BASE
 
 /* Same on SM7150 and SDM845 */
+#if !defined(BOARD_STARLTE)
 #define PSHOLD			0x0c264000UL
 #define GICD_BASE		0x17a00000UL
 #define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define UFS_BASE		0x01d84000UL	/* ufshc@1d84000 */
+#endif
