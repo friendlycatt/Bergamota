@@ -9,8 +9,9 @@ different board descriptions.
 `Failed to write boot-picker-bringup-reason to NVRAM`. This matches XNU's
 [missing-boot-media path](#reported-xnu-root-device-wait), supporting physical
 XNU/BSD root-discovery progress. The [read-only UFS path](#read-only-samsung-ufs)
-now passes local transport, DMA-handoff and compilation checks; its new
-kernel build and device probe are next. Samsung storage access and an iOS
+now passes local transport, DMA-handoff and compilation checks; its
+[Intel-host kernel build](#read-only-samsung-ufs) is running and the device
+probe is next. Samsung storage access and an iOS
 root mount are not established. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
@@ -578,8 +579,11 @@ ADTs and source hashes are retained in ignored
 `research/starlte/ufs-probe-1-delivery/`. CI run
 [40916280553](https://github.com/friendlycatt/Bergamota/actions/runs/40916280553)
 initially failed **before any build step**, because GitHub could not acquire
-a macOS arm64 runner. The unchanged source revision has been retried; the
-new kernel artifact and packaged device image are still pending. The latest
+a macOS arm64 runner. The unchanged-revision retry was still unallocated
+when the Intel fallback was dispatched. Intel-host run
+[40931557218](https://github.com/friendlycatt/Bergamota/actions/runs/40931557218),
+source **`209eb05`**, acquired a runner and reached **Build**; its kernel
+artifact and packaged device image are still pending. The latest
 hardware-tested image remains the refresh image above, which predates UFS.
 The workflow now offers the standard Intel build-host fallback
 [`runner_arch=intel`](CI_CACHE.md#macos-26-runner-capacity-fallback), without
