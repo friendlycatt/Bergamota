@@ -5,8 +5,8 @@
 <h1 align="center">Bergamota Project</h1>
 
 <p align="center">
-  <b>Apple's iOS 18 on a Poco F1</b><br>
-  Xiaomi <code>beryllium</code> · Qualcomm Snapdragon 845 · iOS 18.7.8 (22H352)
+  <b>Apple's iOS 26 on Galaxy S9</b><br>
+  Samsung <code>starlte</code> · Exynos 9810 · iOS 26.6.2
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ---
 
-The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPhone11,8`) to SpringBoard. It runs from its own UFS storage and is driven from a Mac over USB. Four parts make that work, each named after a piece of the bergamot tree:
+The Galaxy S9 boots the **unmodified iOS 26.6.2 userland of the iPhone 11** (`iPhone11,8`) to SpringBoard. It runs from its own UFS storage and is driven from a Mac over USB. Four parts make that work, each named after a piece of the bergamot tree:
 
 | | Part | What it does | Where |
 | --- | --- | --- | --- |
