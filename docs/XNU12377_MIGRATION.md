@@ -94,8 +94,12 @@ backboardd, lockdownd, PosterBoard running, SSH on 192.168.7.2.
 Patch **1131** adds initial `starlte` support under `MACHINE_CONFIG=SWEET`:
 runtime GICv2/v3, ADT-selected PSCI, Aff1:Aff0 CPU validation, platform/CPU
 personalities and boot-video-derived framebuffer mappings. The ordered
-series reconstructs cleanly and component checks pass on Linux/QEMU;
-a full kernel build containing 1131 and an S9 device boot remain pending.
+series reconstructs cleanly and component checks pass on Linux/QEMU.
+Full ARM64 CI builds containing 1131 (**40826795487**) and 1131/1132
+(**40931557218**) now succeed. The user reports physical XNU root-discovery
+progress; the [read-only UFS probe image](STARLTE.md#read-only-ufs-probe-1-image)
+is ready for a photographed device test. Samsung storage/root/userland remain
+unverified.
 Explicitly use `macos_version=26.5` when dispatching CI on `develop`.
 Hardware provenance, exact results and remaining work:
 [`STARLTE.md`](STARLTE.md), [integration checks](../tools/starlte-check/README.md).

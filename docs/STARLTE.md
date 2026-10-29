@@ -9,10 +9,10 @@ different board descriptions.
 `Failed to write boot-picker-bringup-reason to NVRAM`. This matches XNU's
 [missing-boot-media path](#reported-xnu-root-device-wait), supporting physical
 XNU/BSD root-discovery progress. The [read-only UFS path](#read-only-samsung-ufs)
-now passes local transport, DMA-handoff and compilation checks; its
-[Intel-host kernel build](#read-only-samsung-ufs) is running and the device
-probe is next. Samsung storage access and an iOS
-root mount are not established. The physical
+passes local transport, DMA-handoff and compilation checks; its Intel-host
+kernel build succeeded and the [UFS probe image](#read-only-ufs-probe-1-image)
+is ready after an audited full-kernel QEMU hold check. Samsung storage access
+and an iOS root mount are not established. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
@@ -574,20 +574,93 @@ roundtrips and 511 host fastboot checks each. Exact service boundaries are
 documented in [`tools/starlte-check/README.md`](../tools/starlte-check/README.md).
 No Samsung storage hardware result or iOS root mount is established yet.
 
-**Probe delivery preparation:** the checked normal Image/ELF, hardware/QEMU
-ADTs and source hashes are retained in ignored
-`research/starlte/ufs-probe-1-delivery/`. CI run
+**Build provenance:** checked implementation
+**`6584f5d1a6211fd8b09b43ebb7ac7d558457d6ea`**. CI run
 [40916280553](https://github.com/friendlycatt/Bergamota/actions/runs/40916280553)
 initially failed **before any build step**, because GitHub could not acquire
 a macOS arm64 runner. The unchanged-revision retry was still unallocated
 when the Intel fallback was dispatched. Intel-host run
 [40931557218](https://github.com/friendlycatt/Bergamota/actions/runs/40931557218),
-source **`209eb05`**, acquired a runner and reached **Build**; its kernel
-artifact and packaged device image are still pending. The latest
-hardware-tested image remains the refresh image above, which predates UFS.
+source **`209eb05ac5b2db3bfd82446ecf9c50b2759f2626`**, **succeeded** on
+**x86_64 / Xcode 26.1.1 / 17B100**, completed **2026-10-29T19:23:56Z**.
+Build took **48m 40s**; dispatch-to-completion **52m 51s**. **275 patches**
+applied, including 1131/1132, with only the two documented dxb skips.
+The downloaded `xnu-kernel` artifact is **12927160373**; CI checksums pass
+and `errors.txt` is zero bytes. Separately inspected linker summaries contain
+host-tool/linker warnings and interleaved warning fragments, not an established
+build failure. The latest hardware-tested image remains the refresh image
+above, which predates UFS.
 The workflow now offers the standard Intel build-host fallback
 [`runner_arch=intel`](CI_CACHE.md#macos-26-runner-capacity-fallback), without
 changing the ARM64 kernel target or patch series.
+
+### Read-only UFS probe 1 image
+
+**Ready for the phone test:**
+`enxerto/out/starlte/boot-starlte-ufs-probe-1.img`, **10459152 bytes**, with
+adjacent `.img.sha256`. SHA256:
+
+```text
+827720a8383404df538d95513aef50d06624867ddbbc566064e6f1c03ca99002
+```
+
+The image packages the checked **1740800-byte** normal Enxerto Image as
+Samsung's kernel section and the **8410064-byte** hardware SWEETXNU payload
+as its ramdisk section. That payload contains the actual new ARM64
+DEVELOPMENT/SWEET kernel, **22213416 bytes**, SHA256
+`96e56ef2884607ffff6e1ba5de962bd77e0e77ce32c522884d4b78120bad5558`.
+There is **no iOS root filesystem** in the Samsung ramdisk section.
+
+Independent checks verify exact loader/payload sections, unchanged Samsung
+template metadata/second/DTBH/footer and legacy SHA-1. The complete production
+host-loader comparison passes **43778048 loaded RAM bytes**, with dirty
+destinations and unchanged source payload; its host adapters do not execute
+XNU. The delivery's Image/ELF match the earlier checked normal loader, and
+all **61 recorded source hashes** still match. The kernel patch/staging series
+and loader/producers are unchanged between the checked and CI commits.
+
+**Full-kernel QEMU result:** fresh
+`research/starlte/ufs-probe-1-qemu-40931557218-audited/`, **90 seconds**,
+capture checker **0**. The **7078-byte** complete console ring and separately
+viewed screenshot show exactly one:
+
+```text
+STARLTE UFS: probe FAILED (6), writes 0, commands failed 0
+STARLTE UFS: PROBE HOLD - photograph this screen, then reboot to recovery
+```
+
+QEMU has **no Samsung UFS host**: this is the expected early missing-node
+failure/hold, before storage MMIO, **not a storage pass**. `rootvnode=0`,
+`early_panicking=0`; snapshot PC is `_cpu_idle + 0x220`. The trace contains
+**7021 IRQs and one retried Skywalk demand-page fault**, not zero Data Aborts.
+Its exact version-store instructions, runtime pageable-map first address,
+EL1 write translation syndrome and same-PC retry are independently checked;
+unexpected/repeated/non-retried faults remain fatal. The first IRQ-only
+checker failure is preserved unchanged. An older pre-UFS kernel reproduces
+the demand fault but later panics on the unavailable requested `ufsroot0`
+because it lacks the new hold; that failed comparison is **not** a baseline
+pass. The underlying framebuffer runner still exits **3 / blank_screen**
+because its white-font decoder misses the readable coloured console.
+
+**Bundle:** `enxerto/out/starlte/starlte-ufs-probe-1-40931557218.tar.gz`,
+**29551691 bytes**, SHA256
+`257afadde9d259cb4a68e7349338489179a58d768630fdd15864885fbdf96b23`,
+with adjacent `.gz.sha256`. The ignored delivery directory
+`research/starlte/ufs-probe-1-delivery/` contains the image, kernel, loader,
+ADTs/payloads, README, CI/source provenance, checks and raw QEMU captures.
+All **51 manifest entries / 52 archive files** independently verify. Original
+CI preparation run **40916280553** is preserved separately from successful
+run **40931557218**. Failed captures, detailed fault review and final audits
+remain under ignored `research/starlte/`; the older refresh image's checksum
+is unchanged. No device dumps or downloaded artifacts were added to git.
+
+Use only the already selected **TWRP / OrangeFox test-image boot route**.
+Photograph the **whole screen**, including DMA/controller/FMP, LUN/capacity,
+GPT/sample lines, write/failure counters and **PROBE HOLD**, then return to
+recovery. If it stalls earlier, photograph the last visible line. Preserve
+recovery, bootloaders, modem, persist and partition backups; **do not format
+or write userdata for this probe**. No assistant phone writes, Samsung storage
+read, iOS root mount or userspace execution is established.
 
 ## Getting-started guide review for S9
 
@@ -647,13 +720,14 @@ partition, with confirmation before its destructive write as required by
 
 Local evidence is in ignored `research/starlte/root-bringup-review/`: the
 user observation, payload/ADT and source audit, original failing preview,
-fixed preview and platform-test logs. Kernel CI remains **40826795487**;
-this review creates no new boot image or hardware boot result.
+fixed preview and platform-test logs. That root-guide review used kernel CI
+**40826795487** and created no boot image or hardware result; it predates the
+new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Build and deliver the validated UFS source,
-   then obtain a photographed probe result for inherited host state, LUN
+1. **Read-only Samsung storage.** Test the [UFS probe image](#read-only-ufs-probe-1-image)
+   and obtain a photographed result for inherited host state, LUN
    capacity/GPT and repeated userdata reads. Prepare and verify the iOS26 root
    after actual reads; a userdata write needs explicit confirmation.
 2. **Complete the physical XNU record.** Obtain a photograph of the full
