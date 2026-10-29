@@ -4,10 +4,10 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F-class hardware),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-29:** early platform components pass the Linux/QEMU checks
-below. A full kernel containing the S9 changes has yet to be built or booted;
-the user's S9 has yet to be identified and tested. Samsung storage, touch,
-Mali GPU, USB and power-management support remain follow-up work.
+**Status, 2026-10-29:** the full XNU26 CI build succeeded and a Samsung test
+image is ready. QEMU executes VM, CPU and IOKit initialization with readable
+verbose diagnostics. A physical S9 boot remains untested; Samsung storage,
+touch, Mali GPU, USB and power-management support remain follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The new kernel work is
@@ -97,13 +97,38 @@ The runner checks that its ADT agrees with QEMU's MMIO and CPU layout.
 
 ## Build artifacts and Samsung handoff
 
+### Ready test image
+
+Local image: **`enxerto/out/starlte/boot-starlte-xnu26-verbose.img`**,
+**9369616 bytes**. SHA256:
+
+```text
+94a0e8b2f1ac2f9790ec10816427bd988aac21ad926af52d81b95b406daa9d66
+```
+
+This contains the full CI kernel and starlte Enxerto with `BOOTLOG=1`,
+single-core startup and `-v sweetearlyfb=1` diagnostics. It contains no iOS
+root filesystem. Its actual loader, hardware payload, legacy image ID,
+DTBH, footer and preserved header fields were independently verified.
+The baseline image without the two verbosity options is retained as
+`enxerto/out/starlte/boot-starlte-xnu26.img`.
+
+The local delivery directory `research/starlte/delivery-40826795487/`
+contains the image, kernel, loader, ADT, payload, provenance, QEMU screenshot
+and a 12-file `SHA256SUMS`. The verified bundle is
+`enxerto/out/starlte/starlte-xnu26-40826795487.tar.gz` (22660076 bytes).
+Image and archive each have an adjacent `.sha256` file. These generated
+artifacts are ignored by git.
+
+### Reproduction
+
 From the repository root, generate ADTs for inspection and build the raw loader:
 
 ```sh
 mkdir -p research/starlte
 python3 tools/mkadt.py research/starlte/starlte.adt --board starlte --identity n104ap --dump
 python3 tools/mkadt.py research/starlte/qemu.adt --board starlte --identity n104ap \
-    --qemu --gic-version 2 --qemu-cpus 8
+    --qemu --gic-version 2 --qemu-cpus 1
 BOARD=starlte enxerto/build.sh
 ```
 
@@ -162,16 +187,16 @@ The DTBH has one Exynos9810 entry, hardware revisions 26–255, containing a
 extent at handoff. This template has no `/memory` node and does not resolve
 the live RAM/scanout questions above.
 
-Once the full kernel is downloaded, build an early, single-core test image:
+Using the downloaded full kernel, build the verbose, single-core test image:
 
 ```sh
 python3 tools/mkpayload.py xnu/out-starlte/kernel.development.sweet \
-    research/starlte/starlte.adt research/starlte/payload.bin --compress \
-    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam'
+    research/starlte/starlte.adt research/starlte/payload-verbose.bin --compress \
+    --cmdline '-v sweetearlyfb=1 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam'
 BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 enxerto/build.sh
 python3 tools/mkboot-starlte.py /path/to/lineage-starlte/boot.img \
-    enxerto/out/starlte/Image research/starlte/payload.bin \
-    research/starlte/boot-starlte-xnu26.img
+    enxerto/out/starlte/Image research/starlte/payload-verbose.bin \
+    enxerto/out/starlte/boot-starlte-xnu26-verbose.img
 ```
 
 The packager verifies the template's SHA-1 image ID and a byte-identical
@@ -181,10 +206,12 @@ four sections followed by its little-endian size. Output files must be new.
 The raw SWEETXNU payload replaces the Android ramdisk; this image contains
 no iOS root filesystem. Packaging itself performs no device operations.
 
-Observed format check: a repack using the real template, starlte Enxerto and
-a synthetic component payload passes independent header/section/SHA checks.
-The original template roundtrips byte-for-byte; five corruptions are
-rejected. Evidence: `research/starlte/bootimg-check/summary.json`.
+Observed format checks pass for both the original synthetic fixture and
+the delivered full-kernel image. The template roundtrips byte-for-byte;
+five corruptions are rejected. Evidence:
+`research/starlte/bootimg-check/summary.json` and delivery
+`bootimg-verbose-verification.json`. The final payload differs from the
+host-loader-validated baseline only in its 608-byte command-line field.
 
 ## Observed local results
 
@@ -205,42 +232,83 @@ translation support.
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
 | Ordered patch reconstruction | PASS: four staging scripts, 274 applied patches, two documented dxb skips; all 6369 source files and 14 pre-1131 baseline hashes match |
+| Full XNU26 CI build | PASS, run 40826795487; actual ARM64 Mach-O and patch 1131 markers verified |
+| Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43761664 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
+| Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
+| Full-kernel QEMU | VM/CPU/IOKit initialization observed, 1/1 CPU and SGI1 verified; readable verbose screenshot; framebuffer-only decoder exits 3 (details below) |
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
 `cac36bd98fc5ed6c1c6cab7de24bddc069fc62cf16f705d073a9920374c890bf`.
 The reconstruction uses XNU `xnu-12377.121.6` at
 `ac9718fb1af618d5ce8678d0dc6e8a58f252216f` and dxb at
 `663906528d1cd5ea8fde7de6f16de73db9511549`.
-The freestanding guests establish component behavior; full XNU/IOKit
-startup, Samsung firmware and physical device behavior remain untested.
+The freestanding guests establish component behavior. The full-kernel
+observations below extend this to startup execution; Samsung firmware,
+physical device behavior and an iOS root/userland boot remain untested.
+
+## Full-kernel build and QEMU observations
+
+[Run 40826795487](https://github.com/friendlycatt/Bergamota/actions/runs/40826795487)
+successfully built commit `46ccb6552bb5da6115af4df3c737090e3a7ecbc9`, completing
+at `2026-10-29T06:26:05Z` with Xcode 26.1.1 (`17B100`). The downloaded kernel
+is 22196640 bytes, SHA256
+`9c09c6bd2aada6c608d5a67427961c16ed3e46c4e896c83364b8790c0ea9ea28`.
+CI applied patch 1131; the kernel contains the starlte/CPU personalities and
+GIC/PSCI helpers. `errors.txt` is empty. The local C++ infrastructure gaps
+listed above did not prevent this complete macOS build.
+
+For subsequent builds, explicitly dispatch 26.5; `develop` otherwise defaults
+to 15.3. Use a fresh download directory for each run:
+
+```sh
+gh workflow run xnu.yml -R friendlycatt/Bergamota --ref develop \
+    -f macos_version=26.5 -f machine_config=SWEET -f kernel_config=DEVELOPMENT
+gh run list -R friendlycatt/Bergamota --workflow xnu.yml --branch develop --limit 5
+gh run view RUN_ID -R friendlycatt/Bergamota --log
+gh run download RUN_ID -R friendlycatt/Bergamota -n xnu-kernel -D xnu/out-starlte-RUN_ID
+```
+
+The actual kernel ran on QEMU 11.1.2 `virt`, cortex-a76, GICv2 and one CPU:
+
+* **Baseline, 20 seconds:** framebuffer decoder exits **3** with
+  `incomplete_decode`. The screen is black with a white bottom-left block.
+  QEMU records 1119 IRQs and no other exceptions; PC/LR resolve to `cpu_idle`.
+* **Baseline log capture, 20 seconds:** another exit 3; a 5178-byte RAM log
+  records VM/BSD initialization, platform expert registration,
+  `SWEET CPU: 1/1 CPUs initialized, SGI1 verified` and AppleCLCD creation.
+  `rootvnode=0`; a root wait or root/userland boot is not established.
+* **Verbose, 20 seconds:** adding `-v sweetearlyfb=1` produces a readable
+  themed console screenshot and the same startup milestones in the RAM log.
+  QEMU records 1573 IRQs, no other exceptions, and a `cpu_idle` snapshot.
+  No panic appears in the captured ring. The framebuffer decoder still
+  exits **3**, reporting `blank_screen`: it matches only all-white 2x
+  `iso_font` glyphs, which this colored video console does not use.
+
+The framebuffer-serial initialization gap is also observed in guest memory:
+`fbcon_base` and geometry are set, but rows/cols are zero and `uart_initted`
+is false. `serial_init()` returns before common initialization when the
+generated ADT has no `/defaults/serial-device`. `PE_kputc` consequently uses
+`console_write_unbuffered`. Verbose boot exposes that video console; it does
+not repair framebuffer-serial initialization or the decoder.
+
+Evidence is under `research/starlte/full-kernel-40826795487-{gic2,gic2-log,verbose}/`;
+the delivery directory includes `qemu-verbose.png`, `qemu-verbose-log.txt`
+and `qemu-verbose-summary.json`. These runs establish kernel initialization
+progress, not a passing automated screen check or physical Samsung boot.
 
 ## Next milestones
 
-1. **Full XNU26 build.** GitHub CLI is authenticated as `friendlycatt`, and
-   the S9 changes are pushed to the user's `friendlycatt/Bergamota` fork.
-   [Run 40826795487](https://github.com/friendlycatt/Bergamota/actions/runs/40826795487)
-   builds commit `46ccb6552bb5da6115af4df3c737090e3a7ecbc9`; its outcome is
-   pending. Explicitly dispatch 26.5: `develop` otherwise defaults to 15.3.
-
-   ```sh
-   gh workflow run xnu.yml -R friendlycatt/Bergamota --ref develop \
-       -f macos_version=26.5 -f machine_config=SWEET -f kernel_config=DEVELOPMENT
-   gh run list -R friendlycatt/Bergamota --workflow xnu.yml --branch develop --limit 5
-   gh run view RUN_ID -R friendlycatt/Bergamota --log
-   gh run download RUN_ID -R friendlycatt/Bergamota -n xnu-kernel -D xnu/out-starlte
-   ```
-
-   Record the actual run ID, logs and artifact hash in `NOTES.md`; the
-   earlier successful run `40412147688` predates S9 support. The local
-   staging SDK contains only `TargetConditionals.h`, so it cannot replace
-   the macOS/Apple build environment.
-2. **Live handoff facts.** Identify the S9 model/SoC and bootloader state;
+1. **Live handoff facts.** Identify the S9 model/SoC and bootloader state;
    obtain its running FDT, RAM/reservations, actual image placement, incoming EL,
    timer behavior and active DECON configuration. Keep dumps and device
    identifiers under ignored `research/`, `dtb/` or `backup/` paths.
-3. **Single-core device progress.** Establish temporary loading, visible
+2. **Single-core device progress.** Test the verbose image and capture the
+   last visible screen. Establish temporary loading, visible
    diagnostics and timer interrupts, then validate CPU_ON/IPIs on the real
    affinities. Device writes require the confirmations in `AGENTS.md`.
+3. **Console follow-up.** Complete framebuffer-serial initialization when
+   it is the only registered interface; teach QEMU diagnostics to account
+   for the themed video console or consume the captured log ring.
 4. **Samsung peripherals and root boot.** Storage, display refresh, USB,
    input and power support are needed before an iOS userland boot can be
    claimed; Mali acceleration is a separate hardware-driver effort.

@@ -32,7 +32,7 @@ The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPho
 > [!WARNING]
 > This is an experimental bring-up, not a usable phone OS. It installs into `userdata` and **erases Android's user data**. Apple's security model is mostly switched off, so do not put anything personal on it.
 
-**Galaxy S9 / iOS 26 bring-up:** the Exynos9810 `starlte` target now has early platform support and passing loader, interrupt and reset component checks. Full-kernel and S9 device boots are pending. See [`docs/STARLTE.md`](docs/STARLTE.md) for hardware references and status, and [`tools/starlte-check`](tools/starlte-check) for the Linux/QEMU checks. The installation guide below describes the Poco F1.
+**Galaxy S9 / iOS 26 bring-up:** the Exynos9810 `starlte` target has a successful full XNU26 build and a Samsung test `boot.img`. QEMU reaches CPU/IOKit initialization with readable verbose diagnostics; a physical S9 boot remains untested. See [`docs/STARLTE.md`](docs/STARLTE.md) for the image, hardware references and results, and [`tools/starlte-check`](tools/starlte-check) for the Linux/QEMU checks. The installation guide below describes the Poco F1.
 
 ## The boot chain
 

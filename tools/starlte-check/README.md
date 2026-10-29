@@ -2,8 +2,8 @@
 
 These checks compile and execute production interrupt, loader, reset and
 framebuffer components with explicit test-owned service boundaries. They
-run on the host and QEMU `virt`; a full XNU/IOKit boot and Samsung hardware
-validation are subsequent milestones. Hardware provenance and port status:
+run on the host and QEMU `virt`. Full-kernel CI/QEMU observations, Samsung
+hardware provenance and device-validation status are recorded in
 [`docs/STARLTE.md`](../../docs/STARLTE.md).
 
 ## Prerequisites
