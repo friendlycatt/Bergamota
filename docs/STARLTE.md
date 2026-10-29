@@ -7,8 +7,9 @@ different board descriptions.
 **Status, 2026-10-29:** the full XNU26 CI build succeeded. The user's first
 physical test remains on a **plain Samsung logo**, with no visible Enxerto
 output. QEMU executes VM, CPU and IOKit initialization with readable verbose
-diagnostics. An early display probe is in preparation; Samsung storage,
-touch, Mali GPU, USB and power-management support remain follow-up work.
+diagnostics. [Display probe 1](#display-probe-1) is ready for the next test.
+Samsung storage, touch, Mali GPU, USB and power-management support remain
+follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The new kernel work is
@@ -106,7 +107,10 @@ The runner checks that its ADT agrees with QEMU's MMIO and CPU layout.
 
 ## Build artifacts and Samsung handoff
 
-### Ready test image
+### Initial full-kernel image
+
+The user tested this image and reported the plain Samsung logo. The current
+diagnostic image is [display probe 1](#display-probe-1).
 
 Local image: **`enxerto/out/starlte/boot-starlte-xnu26-verbose.img`**,
 **9369616 bytes**. SHA256:
@@ -197,7 +201,8 @@ The DTBH has one Exynos9810 entry, hardware revisions 26–255, containing a
 extent at handoff. This template has no `/memory` node and does not resolve
 the live RAM/scanout questions above.
 
-Using the downloaded full kernel, build the verbose, single-core test image:
+Using the downloaded full kernel, rebuild a verbose single-core image with
+the current loader (the original delivered image above is preserved):
 
 ```sh
 python3 tools/mkpayload.py xnu/out-starlte/kernel.development.sweet \
@@ -206,7 +211,7 @@ python3 tools/mkpayload.py xnu/out-starlte/kernel.development.sweet \
 BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 enxerto/build.sh
 python3 tools/mkboot-starlte.py /path/to/lineage-starlte/boot.img \
     enxerto/out/starlte/Image research/starlte/payload-verbose.bin \
-    enxerto/out/starlte/boot-starlte-xnu26-verbose.img
+    enxerto/out/starlte/boot-starlte-xnu26-rebuild.img
 ```
 
 The packager verifies the template's SHA-1 image ID and a byte-identical
@@ -328,6 +333,17 @@ in recovery, and the user asked to proceed without further recovery checks.
 
 ### Display probe 1
 
+**Current test image:** `enxerto/out/starlte/boot-starlte-display-probe-1.img`,
+**9369616 bytes**, with adjacent `.img.sha256`. SHA256:
+
+```text
+8918981c26ddc8402f194298b2a68f963f0f999c504cae1973857db3c92f4195
+```
+
+Loader source: `e4d521886d338a953c6c3476d77702979e11451d`. It reuses the
+verbose hardware payload and kernel from CI run **40826795487**. The
+physical result for this probe is **pending**.
+
 Build a probe around the existing verbose hardware payload:
 
 ```sh
@@ -352,6 +368,13 @@ Image is 655360 bytes, SHA256
 The QEMU probe screenshots show the held diagnostics and RGB strip, with
 the destination sentinel intact. Samsung display MMIO is skipped there;
 the actual register write/readback and physical refresh remain untested.
+
+Independent packaging verification passes: the kernel section is exactly
+the QEMU-checked probe Image, the payload is unchanged, and template header
+metadata/second stage/DTBH/footer and legacy SHA-1 are verified. The actual
+template's FDT also matches the production Exynos9810 identity gate.
+Provenance, verification, check log, disassembly and screenshots are under
+ignored `research/starlte/display-probe-1-delivery/`.
 
 The header's `EL in/now`, `SCTLRin`, `IMAGE`, `DTB`, `INITRD` and `RD END`
 record loader entry and placement. `TRIGGER old/new`, `FRAMES old/now`,
