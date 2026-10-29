@@ -8,7 +8,7 @@ different board descriptions.
 shows physical XNU reaching Samsung UFS initialization and accepting the DMA
 handoff, then **`host not ready (hce 0x0 hcs 0x10f)` / FAILED (6) / PROBE HOLD**.
 It stops before FMP setup or storage commands. The [read-only UFS path](#read-only-samsung-ufs)
-passes local transport, DMA-handoff and compilation checks; its Intel-host
+passes local transport, DMA-handoff and compilation checks; the probe-1 Intel-host
 kernel build and audited full-kernel QEMU failure hold succeeded. Samsung storage
 reads and an iOS root mount are not established. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
@@ -729,7 +729,11 @@ Fresh ordered-series reconstruction also passes: four staging scripts,
 **276 patches**, the two documented dxb skips, and all **6369 source files**
 match the prepared tree exactly (`research/starlte/series-check-ufs-probe-2/`).
 All 61 original probe-1 source hashes and its image/archive checksums remain
-unchanged. A fresh Intel CI build and the probe-2 image remain pending.
+unchanged. The correction is committed/pushed as
+**`f359612c182a30f27071210b7baa25986b1fe08f`**. Fresh Intel-host XNU26
+[CI 40955206538](https://github.com/friendlycatt/Bergamota/actions/runs/40955206538)
+is **in progress** (26.5 / DEVELOPMENT / SWEET, Xcode 26.1, Intel runner);
+its kernel artifact and the separate probe-2 image remain pending.
 
 ## Getting-started guide review for S9
 
