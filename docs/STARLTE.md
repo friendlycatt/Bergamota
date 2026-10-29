@@ -550,7 +550,7 @@ selected by the `samsung,starlte` board identity:
 Probe payload arguments:
 
 ```text
--v sweetearlyfb=1 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam rd=ufsroot0 ufsprobe=1
+-v sweetearlyfb=1 sweetfb_statlog=0 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam rd=ufsroot0 ufsprobe=1
 ```
 
 Build the loader with `STARLTE_DISPLAY_PROBE=0`. Here **`ufsprobe=1` is a
@@ -560,6 +560,8 @@ kernel storage probe**, not the earlier loader-only display probe: it prints
 Early ADT/DMA/mapping failures also reach the hold. Photograph the whole
 screen, including the controller/capacity/GPT lines. If execution stalls
 earlier, the last visible line identifies the next investigation point.
+`sweetfb_statlog=0` disables the existing periodic framebuffer IOLogs so they
+cannot scroll the held result off-screen; it does not disable display refresh.
 
 **Local results:** `ufs.py --out research/starlte/ufs-check-final` exits 0:
 **93 byte-level host scenarios**, **24 ADT ownership/bounds cases**, and
@@ -570,6 +572,15 @@ display-probe holds. Shared sweet/beryllium builds pass their kernel/DTB
 roundtrips and 511 host fastboot checks each. Exact service boundaries are
 documented in [`tools/starlte-check/README.md`](../tools/starlte-check/README.md).
 No Samsung storage hardware result or iOS root mount is established yet.
+
+**Probe delivery preparation:** the checked normal Image/ELF, hardware/QEMU
+ADTs and source hashes are retained in ignored
+`research/starlte/ufs-probe-1-delivery/`. CI run
+[40916280553](https://github.com/friendlycatt/Bergamota/actions/runs/40916280553)
+initially failed **before any build step**, because GitHub could not acquire
+a macOS arm64 runner. The unchanged source revision has been retried; the
+new kernel artifact and packaged device image are still pending. The latest
+hardware-tested image remains the refresh image above, which predates UFS.
 
 ## Getting-started guide review for S9
 
