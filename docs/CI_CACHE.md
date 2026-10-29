@@ -43,6 +43,26 @@ object is keyed on its full input.
 - Entries for `ci-cache` or other branches are not visible to `main` (and vice versa),
   except that branches can read the default branch's caches.
 
+## macOS 26 runner capacity fallback
+
+For 26.x builds, manual dispatch accepts `runner_arch=intel` to select the
+standard `macos-26-intel` host if GitHub cannot allocate a `macos-26` arm64
+runner. This is not a larger-runner request and does not change the ARM64
+kernel target, XNU source release or selected Xcode. Other release families
+ignore this option; the default keeps the existing runner selection.
+
+```sh
+gh workflow run xnu.yml -R friendlycatt/Bergamota --ref develop \
+  -f macos_version=26.5 -f machine_config=SWEET \
+  -f kernel_config=DEVELOPMENT -f runner_arch=intel
+```
+
+GitHub's [macOS 26 Intel software list](https://github.com/actions/runner-images/blob/9329c776c4a38d3dcb31fc78b8180005041c07fb/images/macos/macos-26-Readme.md)
+includes Xcode 26.1.1. Host-tool cache keys include `runner.arch`; ccache also
+hashes the compiler binary and full compilation inputs. Logs print the host
+architecture and actual Xcode version. A runner-allocation failure before
+any job step is not a kernel compile failure.
+
 ## Is the kernel the same?
 
 Compared main run 39478166902 (no cache), cold run (1077 misses) and warm run

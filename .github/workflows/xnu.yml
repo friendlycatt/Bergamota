@@ -9,6 +9,13 @@ on:
       xcode_version:
         description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
         default: ""
+      runner_arch:
+        description: 26.x build host (intel uses the standard macos-26-intel runner when arm64 capacity is unavailable; kernel remains ARM64)
+        type: choice
+        options:
+          - default
+          - intel
+        default: default
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
@@ -60,7 +67,8 @@ jobs:
     # (Xcode 16's iig emits IORPC.kernelContent, which that xnu lacks).
     # 15.x sources (xnu-11215): macos-15 with Xcode 16.2 (the macOS 15.2/15.3 era toolchain).
     # 26.x sources (xnu-12377): macos-26 with Xcode 26.1 (what dxb's own CI builds 26.5 with).
-    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
+    # The optional Intel label changes only the host, not MACOS_VERSION/MACHINE_CONFIG.
+    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && (inputs.runner_arch == 'intel' && 'macos-26-intel' || 'macos-26') || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +131,7 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
+          uname -m
           ls -d /Applications/Xcode*.app
           if [ -n "${{ inputs.xcode_version }}" ]; then
             XC=$(ls -d /Applications/Xcode_${{ inputs.xcode_version }}*.app | sort -V | tail -1)

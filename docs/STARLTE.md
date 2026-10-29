@@ -581,6 +581,9 @@ initially failed **before any build step**, because GitHub could not acquire
 a macOS arm64 runner. The unchanged source revision has been retried; the
 new kernel artifact and packaged device image are still pending. The latest
 hardware-tested image remains the refresh image above, which predates UFS.
+The workflow now offers the standard Intel build-host fallback
+[`runner_arch=intel`](CI_CACHE.md#macos-26-runner-capacity-fallback), without
+changing the ARM64 kernel target or patch series.
 
 ## Getting-started guide review for S9
 
