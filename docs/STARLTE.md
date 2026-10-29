@@ -114,8 +114,9 @@ component guests work with this reduced ADT.
 Outputs are `enxerto/out/starlte/{Image,enxerto.elf}`. An optional absolute
 payload path passed to `build.sh` is copied to `out/starlte/payload.bin`.
 The raw ARM64 Image is position-independent and includes its BSS/stacks.
-Samsung boot-image packaging and the device's temporary boot mechanism
-remain to be established; this target currently produces the raw Image.
+[`tools/mkboot-starlte.py`](../tools/mkboot-starlte.py) wraps it and a
+SWEETXNU payload using the legacy Samsung layout described below. The
+device's actual bootloader handoff remains to be tested.
 
 The implemented entry contract is:
 
@@ -143,6 +144,47 @@ boards default to the legacy **608-byte** ABI (size 736); select
 `BOOT_ARGS_LINE_LENGTH=1024` for their XNU26 builds. SWEETXNU payloads
 retain their 608-byte command-line field in both versions. The host QEMU
 runner defaults to 1024, with `--boot-args-line-length 608` for old kernels.
+
+### Samsung boot.img from a template
+
+The user supplied `lineage-24.0-20261014-unofficial-starlte/boot.img`, SHA256
+`ec07cbff03503baeb9ada4f72fe6166fbc67d209fd2fec584969336a4ecd5200`.
+Observed layout: raw ARM64 Image, gzip Android ramdisk, separate **DTBH v2**
+section, and the 16-byte `SEANDROIDENFORCE` footer. Its pre-versioned Android
+header has **dt_size = 305152 at offset 40**, where modern tools expect
+`header_version`. Page size is 2048; header load addresses are kernel
+`0x10008000`, ramdisk `0x11000000`, tags `0x10000100`. These header fields
+are not observations of the bootloader's actual RAM placement.
+
+The DTBH has one Exynos9810 entry, hardware revisions 26–255, containing a
+301372-byte FDT. Its `/chosen` contains placeholder initrd properties
+`0x82000000` / `0x821fffff`; the bootloader must supply the actual payload
+extent at handoff. This template has no `/memory` node and does not resolve
+the live RAM/scanout questions above.
+
+Once the full kernel is downloaded, build an early, single-core test image:
+
+```sh
+python3 tools/mkpayload.py xnu/out-starlte/kernel.development.sweet \
+    research/starlte/starlte.adt research/starlte/payload.bin --compress \
+    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam'
+BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 enxerto/build.sh
+python3 tools/mkboot-starlte.py /path/to/lineage-starlte/boot.img \
+    enxerto/out/starlte/Image research/starlte/payload.bin \
+    research/starlte/boot-starlte-xnu26.img
+```
+
+The packager verifies the template's SHA-1 image ID and a byte-identical
+roundtrip, replaces the kernel and ramdisk, and preserves the header's
+other fields, second stage, DTBH and footer. The SHA-1 includes each of the
+four sections followed by its little-endian size. Output files must be new.
+The raw SWEETXNU payload replaces the Android ramdisk; this image contains
+no iOS root filesystem. Packaging itself performs no device operations.
+
+Observed format check: a repack using the real template, starlte Enxerto and
+a synthetic component payload passes independent header/section/SHA checks.
+The original template roundtrips byte-for-byte; five corruptions are
+rejected. Evidence: `research/starlte/bootimg-check/summary.json`.
 
 ## Observed local results
 
@@ -193,7 +235,7 @@ startup, Samsung firmware and physical device behavior remain untested.
    staging SDK contains only `TargetConditionals.h`, so it cannot replace
    the macOS/Apple build environment.
 2. **Live handoff facts.** Identify the S9 model/SoC and bootloader state;
-   obtain its running FDT, RAM/reservations, boot-image layout, incoming EL,
+   obtain its running FDT, RAM/reservations, actual image placement, incoming EL,
    timer behavior and active DECON configuration. Keep dumps and device
    identifiers under ignored `research/`, `dtb/` or `backup/` paths.
 3. **Single-core device progress.** Establish temporary loading, visible

@@ -25,7 +25,9 @@ python3 tools/starlte-check/enxerto.py --qemu    # 12 host cases + 4 complete Im
 
 An optional absolute payload path passed to `build.sh` is copied to
 `enxerto/out/starlte/payload.bin`. Samsung USB/fastboot, storage, charging
-and boot-image packaging remain pending. The implemented entry accepts a
+remain pending. `tools/mkboot-starlte.py TEMPLATE Image payload.bin OUT.img`
+packages the loader/payload with the supplied Lineage boot image's legacy
+Samsung header, separate DTBH and footer. The implemented entry accepts a
 Linux-style FDT/initrd handoff at EL1 or bare EL2; the actual S9 handoff and
 inherited display need verification. See [`docs/STARLTE.md`](../docs/STARLTE.md)
 and the [integration-check README](../tools/starlte-check/README.md).
