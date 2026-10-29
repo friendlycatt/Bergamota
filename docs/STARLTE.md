@@ -735,6 +735,21 @@ unchanged. The correction is committed/pushed as
 is **in progress** (26.5 / DEVELOPMENT / SWEET, Xcode 26.1, Intel runner);
 its kernel artifact and the separate probe-2 image remain pending.
 
+**Probe-2 preparation:** separate ignored `research/starlte/ufs-probe-2-delivery/`
+now holds the unchanged checked Image/ELF and fresh hardware/QEMU ADTs.
+The DMA/Image properties remain runtime-filled placeholders, not historic
+phone addresses. All **351 loader/producer/check-tool/patch/staging/workflow
+source hashes** match f359612; **158 protected probe-1 files** are unchanged.
+Nine reproduction-script syntax checks and **18 delivery-guard tests** pass.
+Synthetic finalizer/archive and old-kernel host-loader smoke also pass; these
+are **format/plumbing tests, not new-kernel or Samsung HCE/DMA execution**.
+Fresh ADTs intentionally carry fresh 256-byte random seeds; an initial smoke
+comparison's false byte-identity assumption is preserved as a failure, and its
+fixed fixture comparison normalizes only the seed without changing real ADTs.
+Actual packaging requires the successful fresh CI kernel, HCE diagnostic
+markers and the tested driver hash in its downloaded patched build tree.
+Preparation/packaging JSON will remain separate from finalized records.
+
 ## Getting-started guide review for S9
 
 The pasted guide describes Poco F1 / Qualcomm and older iOS18 defaults.
