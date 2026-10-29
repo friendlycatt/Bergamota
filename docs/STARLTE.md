@@ -4,15 +4,13 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F-class hardware),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-29:** the user reports that the
-[XNU-enabled refresh image](#xnu-enabled-refresh-image) now displays
-`Failed to write boot-picker-bringup-reason to NVRAM`. This matches XNU's
-[missing-boot-media path](#reported-xnu-root-device-wait), supporting physical
-XNU/BSD root-discovery progress. The [read-only UFS path](#read-only-samsung-ufs)
+**Status, 2026-10-29:** the [UFS probe 1 photograph](#photographed-ufs-probe-1-result)
+shows physical XNU reaching Samsung UFS initialization and accepting the DMA
+handoff, then **`host not ready (hce 0x0 hcs 0x10f)` / FAILED (6) / PROBE HOLD**.
+It stops before FMP setup or storage commands. The [read-only UFS path](#read-only-samsung-ufs)
 passes local transport, DMA-handoff and compilation checks; its Intel-host
-kernel build succeeded and the [UFS probe image](#read-only-ufs-probe-1-image)
-is ready after an audited full-kernel QEMU hold check. Samsung storage access
-and an iOS root mount are not established. The physical
+kernel build and audited full-kernel QEMU failure hold succeeded. Samsung storage
+reads and an iOS root mount are not established. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
@@ -127,7 +125,7 @@ QEMU ADTs omit UFS by default; QEMU `virt` does not model the Samsung host.
 
 ### XNU-enabled refresh image
 
-**Current test image:** `enxerto/out/starlte/boot-starlte-xnu26-refresh.img`,
+**Earlier XNU-enabled test image:** `enxerto/out/starlte/boot-starlte-xnu26-refresh.img`,
 **9369616 bytes**, with adjacent `.img.sha256`. SHA256:
 
 ```text
@@ -531,8 +529,11 @@ selected by the `samsung,starlte` board identity:
    the copied ADT. Both loader and kernel validate size, alignment, containment,
    DMA32 bounds and separation from XNU's managed RAM. The kernel uses
    `ml_io_map_wcomb()` (Normal non-cacheable) and explicit DMA barriers.
-2. **Conservative host takeover.** Require an enabled/ready host, idle transfer
-   and task lists, and stopped lists before the FMP format SMC
+2. **Conservative host takeover.** Require inherited device/list/UIC readiness
+   and idle transfer/task lists. Additive patch 1133 allows one bounded HCE
+   enable-only attempt after stopping both lists; enabled hosts are not restarted.
+   Require HCE and all readiness bits afterward, without host error or new
+   pending requests, before the FMP format SMC
    (`x0=0xc2001810`, `x1=x2=0`, `x3=3`). Check PRDT register setup and the new
    list-base readback before issuing commands. An Exynos timeout permanently
    quarantines the arena, even when request-clear succeeds; cached initialization
@@ -564,7 +565,7 @@ earlier, the last visible line identifies the next investigation point.
 `sweetfb_statlog=0` disables the existing periodic framebuffer IOLogs so they
 cannot scroll the held result off-screen; it does not disable display refresh.
 
-**Local results:** `ufs.py --out research/starlte/ufs-check-final` exits 0:
+**Original probe-1 local results:** `ufs.py --out research/starlte/ufs-check-final` exits 0:
 **93 byte-level host scenarios**, **24 ADT ownership/bounds cases**, and
 complete `sweet_ufs.c` real-header Mach-O compilation pass, with fatal
 ASan/UBSan checking. `enxerto.py --qemu` also passes 12 host payload cases,
@@ -588,15 +589,15 @@ applied, including 1131/1132, with only the two documented dxb skips.
 The downloaded `xnu-kernel` artifact is **12927160373**; CI checksums pass
 and `errors.txt` is zero bytes. Separately inspected linker summaries contain
 host-tool/linker warnings and interleaved warning fragments, not an established
-build failure. The latest hardware-tested image remains the refresh image
-above, which predates UFS.
+build failure. The newer probe-1 photograph below reaches UFS initialization;
+the refresh image above predates UFS.
 The workflow now offers the standard Intel build-host fallback
 [`runner_arch=intel`](CI_CACHE.md#macos-26-runner-capacity-fallback), without
 changing the ARM64 kernel target or patch series.
 
 ### Read-only UFS probe 1 image
 
-**Ready for the phone test:**
+**Delivered and subsequently photographed on the phone:**
 `enxerto/out/starlte/boot-starlte-ufs-probe-1.img`, **10459152 bytes**, with
 adjacent `.img.sha256`. SHA256:
 
@@ -654,13 +655,81 @@ run **40931557218**. Failed captures, detailed fault review and final audits
 remain under ignored `research/starlte/`; the older refresh image's checksum
 is unchanged. No device dumps or downloaded artifacts were added to git.
 
-Use only the already selected **TWRP / OrangeFox test-image boot route**.
-Photograph the **whole screen**, including DMA/controller/FMP, LUN/capacity,
-GPT/sample lines, write/failure counters and **PROBE HOLD**, then return to
-recovery. If it stalls earlier, photograph the last visible line. Preserve
-recovery, bootloaders, modem, persist and partition backups; **do not format
-or write userdata for this probe**. No assistant phone writes, Samsung storage
-read, iOS root mount or userspace execution is established.
+Probe tests use the already selected **TWRP / OrangeFox test-image boot route**.
+Preserve recovery, bootloaders, modem, persist and partition backups;
+**do not format or write userdata for this probe**. No assistant phone writes,
+Samsung storage read, iOS root mount or userspace execution is established.
+
+### Photographed UFS probe 1 result
+
+The user's photograph, received on 2026-10-29 after probe-1 delivery, shows:
+
+```text
+STARLTE UFS: DMA32 0x801a0000+0x104000 inside Image 0x800fc000+0x1ac000, Normal-NC
+SWEET UFS: host not ready (hce 0x0 hcs 0x10f)
+STARLTE UFS: probe FAILED (6), writes 0, commands failed 0
+STARLTE UFS: PROBE HOLD
+```
+
+Clearly transcribed host registers: **CAP `0x1303ff0f`**, **VER `0x210`**,
+**IS/transfer DBR `0`**, **transfer RSR `1`**. The UTRL base is not reliably
+transcribed; task-list registers were not captured. No installed-image checksum
+was supplied. The new markers establish physical execution of this UFS path,
+not the exact installed bytes.
+
+The DMA pool ends at `0x802a4000`, within the Image mapping ending at
+`0x802a8000`, leaving `0x4000`. This supports successful handoff validation and
+mapping, **not actual controller DMA access**. `enxerto/mmu.c` rounds the Image
+mapping outward to 16 KiB pages: the photographed `0x1ac000` mapping span is
+not the 1740800-byte raw Image size. These are runtime observations, not
+addresses to hardcode into another image.
+
+Patch 1132 rejects HCE=0 at `ufs_take_over_host()` before FMP setup, list-base
+replacement or storage commands. “Scanning LUNs 0..7” is an announcement;
+there are no photographed LUN/capacity/GPT/sample results. The zero counters
+are consistent with this early rejection. Full transcription and limits stay
+ignored in `research/starlte/device-ufs-probe-1/observation.json`; this session
+has checkpoint-carried visible values, not a local copy of the original JPEG.
+
+**Source review:** [Samsung `ufshcd.c`][samsung-ufshcd]:983–985 returns zero
+when HCE bit 0 is **set**. `ufs-exynos.c:551–568` does not assign
+`UFSHCD_QUIRK_USE_OF_HCE`; merely finding its generic alternate path does not
+justify an S9 HCE bypass. The normal enable sequence writes HCE=1, waits 1 ms,
+then polls with at most ten 5 ms delays (4049–4101). HCS `0x10f` has DP,
+transfer/task/UIC readiness set; its upper power-change status is `PWR_LOCAL`.
+Samsung's operational gate requires all three list/UIC readiness bits
+(804–815,4005–4015). The photograph alone does not establish why HCE is zero.
+
+A bounded **enable-only** continuation is implemented in additive
+[`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch):
+**6172 bytes**, SHA256
+`aeb561be8a745543a00dd7216140b45ea49e90bb30a10231c0923709c809c73b`.
+Patch 1132 and completed probe-1 artifacts remain unchanged.
+
+Only an inherited ready/idle Exynos host can reach the attempt. Both lists
+must stop first; HCE=1 is then written once, followed by a 1 ms wait and at
+most ten 5 ms delays. Already-enabled hosts are not restarted. Device,
+transfer/task/UIC readiness, error status and idle/stopped lists are checked
+again before FMP/list-base setup or storage commands. The code adds read-only
+task-list and vendor reset/clock/GPIO diagnostics; it does not write those
+vendor registers, bypass HCE, calibrate the PHY or issue `DME_LINKSTARTUP`.
+If enabling loses readiness, it reports that and stops. This is **not complete
+cold-host initialization**, nor proof that enabling will preserve the real link.
+
+**Correction validation:** `ufs.py --out research/starlte/ufs-probe-2-check`
+exits **0**: **135 host scenarios**, **24 ADT ownership/bounds cases**, fatal
+ASan/UBSan and complete real-header Mach-O compilation pass. The host models
+the photographed HCE=0/HCS=0x10f state, immediate write echo, initialization
+transition, exact wait bounds, readiness/error/list-state loss, late completion
+and cached failure. Software MMIO allowlists forbid blind PHY/clock/reset or
+UIC command writes; Qualcomm regressions remain covered. The new driver hash
+is `5b73d355232fc4d9319f43245c3785bbe7301e43b2947617c4ca118200b892ef`.
+Forward/reverse application matches the saved probe-1 baseline exactly.
+Fresh ordered-series reconstruction also passes: four staging scripts,
+**276 patches**, the two documented dxb skips, and all **6369 source files**
+match the prepared tree exactly (`research/starlte/series-check-ufs-probe-2/`).
+All 61 original probe-1 source hashes and its image/archive checksums remain
+unchanged. A fresh Intel CI build and the probe-2 image remain pending.
 
 ## Getting-started guide review for S9
 
@@ -670,7 +739,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131/1132, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates the UFS patch. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1133, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
@@ -726,12 +795,15 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Test the [UFS probe image](#read-only-ufs-probe-1-image)
-   and obtain a photographed result for inherited host state, LUN
-   capacity/GPT and repeated userdata reads. Prepare and verify the iOS26 root
-   after actual reads; a userdata write needs explicit confirmation.
-2. **Complete the physical XNU record.** Obtain a photograph of the full
-   last-visible screen surrounding the reported missing-media/NVRAM message.
+1. **Read-only Samsung storage.** Correct the photographed HCE readiness
+   rejection with a source-justified, bounded Exynos enable-only path; validate,
+   rebuild and deliver probe 2. Obtain actual LUN capacity/GPT and repeated
+   userdata reads before preparing the iOS26 root. A userdata write needs
+   explicit confirmation.
+2. **Complete the physical XNU record.** The probe-1 photograph establishes
+   XNU UFS initialization/failure hold, not a root mount or userland boot.
+   Capture whole-screen results of subsequent tests, including the last visible
+   line if enable or storage discovery stalls.
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
    observed zero `CNTFRQ_EL0` register.

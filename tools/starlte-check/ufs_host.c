@@ -155,6 +155,7 @@ SERVICE(sweet_a630_probe)
 /* Deliberately independent of struct utrd/ucd and their layout constants. */
 #define MODEL_WINDOW 0x204000u
 #define MODEL_DATA (3u << 20)
+#define MODEL_IS_ERRORS 0x71884u
 struct property {
 	const char *name;
 	unsigned size;
@@ -176,12 +177,16 @@ struct model {
 	bool exynos, unknown_board, node_present, chosen_present;
 	bool hci_mapped, vendor_mapped, pool_mapped;
 	bool sticky_dbr, stop_stuck, tm_stop_stuck, stop_race, base_stuck, start_stuck;
+	bool stop_readiness_loss, stop_host_error, hce_pending, hce_stuck;
 	bool prdt_stuck, nexus_stuck, fail_hci_map, fail_vendor_map, fail_pool_map;
 	bool fail_alloc, fail_verify_alloc, expect_hold, waiting_hold;
 	uint64_t smc_result, now, wake, pa, allocation_pa;
+	uint64_t hce_start, hce_latency, hce_completed;
+	uint32_t hce_hcs, hce_is, hce_dbr, hce_tm_dbr, hce_rsr, hce_tm_rsr;
 	uint32_t r[128], v[128], size, clear_value, visits;
 	unsigned mmio_reads, mmio_writes, vendor_writes, commands, writes, syncs;
 	unsigned base_writes, allocations, maps, smcs, barriers, cache_ops, sleeps;
+	unsigned hce_enables, hce_echo_reads, hce_init_reads;
 	unsigned bdevs, cdevs, nodes, last_prds, last_len, last_op;
 	unsigned opcount[256], fault_left, fault_skip;
 	int fault_op;
@@ -298,8 +303,10 @@ static void reset_model(bool exynos, unsigned block)
 	CHECK(posix_memalign((void **)&m.allocation, 0x4000, MODEL_WINDOW + 0x8000) == 0);
 	memset(m.allocation, 0xa7, MODEL_WINDOW + 0x8000);
 	m.dma = m.allocation + 0x4000;
-	m.r[0x34 / 4] = 1;
-	m.r[0x30 / 4] = 3;
+	m.r[0x34 / 4] = exynos ? 0 : 1;
+	m.r[0x30 / 4] = exynos ? 0x10f : 3;
+	m.hce_latency = 6000000;
+	m.hce_hcs = 0x10f;
 	m.r[0x00 / 4] = exynos ? 31 : 0x100001f;
 	m.r[0x08 / 4] = 0x210;
 	m.r[0x50 / 4] = 0x82000000;
@@ -349,6 +356,8 @@ static void disk_read(unsigned lun, uint64_t lba, uint8_t *dst, uint32_t bytes)
 static void model_command(void)
 {
 	CHECK(m.r[0x60 / 4] == 1 && m.r[0x58 / 4] == 1);
+	CHECK(!m.hce_pending && (m.r[0x34 / 4] & 1));
+	if (m.exynos) { CHECK((m.r[0x30 / 4] & 0xff) == 0xf); }
 	uint64_t list = m.r[0x50 / 4] | (uint64_t)m.r[0x54 / 4] << 32;
 	CHECK(!(list & 1023));
 	uint8_t *t = dma_at(list, 32);
@@ -492,10 +501,33 @@ static void model_command(void)
 	m.r[0x58 / 4] = 0;
 }
 
+static void model_enable_progress(void)
+{
+	if (!m.hce_pending) { return; }
+	uint64_t elapsed = m.now - m.hce_start;
+	if (elapsed < 1000000) { return; } /* immediate write echo, not initialized */
+	m.r[0x34 / 4] = 0;
+	if (m.hce_stuck || elapsed < m.hce_latency) { return; }
+	m.r[0x34 / 4] = 1;
+	m.r[0x30 / 4] = m.hce_hcs;
+	m.r[0x20 / 4] |= m.hce_is;
+	m.r[0x58 / 4] = m.hce_dbr;
+	m.r[0x78 / 4] = m.hce_tm_dbr;
+	m.r[0x60 / 4] = m.hce_rsr;
+	m.r[0x80 / 4] = m.hce_tm_rsr;
+	m.hce_pending = false;
+	m.hce_completed = m.now;
+}
+
 static uint32_t model_rd(uint32_t off, bool vendor)
 {
 	CHECK((vendor ? m.vendor_mapped : m.hci_mapped) && off < 0x200 && !(off & 3));
 	m.mmio_reads++;
+	if (!vendor && off == 0x34 && m.hce_pending) {
+		if (m.now - m.hce_start < 1000000) { m.hce_echo_reads++; }
+		else { m.hce_init_reads++; }
+	}
+	model_enable_progress();
 	return (vendor ? m.v : m.r)[off / 4];
 }
 
@@ -505,10 +537,22 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 	m.mmio_writes++;
 	if (vendor) {
 		CHECK(m.exynos);
+		CHECK(off == 0 || off == 4 || off == 0x40); /* no blind PHY/clock/reset writes */
 		m.vendor_writes++;
 		if (m.prdt_stuck && (off == 0 || off == 4)) { return; }
 		if (m.nexus_stuck && off == 0x40) { return; }
 		m.v[off / 4] = value;
+		return;
+	}
+	CHECK(off == 0x20 || off == 0x24 || off == 0x34 || off == 0x50 ||
+	    off == 0x54 || off == 0x58 || off == 0x5c || off == 0x60 || off == 0x80);
+	if (off == 0x34) {
+		CHECK(m.exynos && value == 1 && !m.hce_pending && !(m.r[off / 4] & 1));
+		CHECK(!m.r[0x60 / 4] && !m.r[0x80 / 4] && !m.r[0x58 / 4] && !m.r[0x78 / 4]);
+		CHECK((m.r[0x30 / 4] & 0xff) == 0xf && !(m.r[0x20 / 4] & MODEL_IS_ERRORS));
+		CHECK(!m.smcs && !m.base_writes && !m.commands && ++m.hce_enables == 1);
+		m.hce_pending = true; m.hce_start = m.now;
+		m.r[off / 4] = 1; /* controller's immediate echo must not pass the enable wait */
 		return;
 	}
 	if (off == 0x20) { m.r[off / 4] &= ~value; return; }
@@ -521,6 +565,8 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 	if (off == 0x60 && !value && m.stop_stuck) { return; }
 	if (off == 0x80 && !value && m.tm_stop_stuck) { return; }
 	if (off == 0x60 && !value && m.stop_race) { m.r[0x58 / 4] = 2; }
+	if (off == 0x60 && !value && m.stop_readiness_loss) { m.r[0x30 / 4] &= ~8u; }
+	if (off == 0x60 && !value && m.stop_host_error) { m.r[0x20 / 4] |= 0x10000; }
 	if (off == 0x60 && value && m.start_stuck) { return; }
 	if (off == 0x50 || off == 0x54) {
 		CHECK(m.r[0x60 / 4] == 0);
@@ -535,6 +581,7 @@ static uint64_t model_smc(void)
 {
 	CHECK(m.exynos && !m.r[0x60 / 4] && !m.r[0x80 / 4]);
 	CHECK(!m.r[0x58 / 4] && !m.r[0x78 / 4]);
+	CHECK(!m.hce_pending && (m.r[0x34 / 4] & 1) && (m.r[0x30 / 4] & 0xff) == 0xf);
 	m.smcs++;
 	return m.smc_result;
 }
@@ -707,9 +754,123 @@ static void test_transport(void)
 	passed(case_name);
 }
 
+static void test_enable(void)
+{
+	case_name = "photographed HCE=0 / HCS=0x10f enable-only and read-only discovery";
+	reset_model(true, 4096);
+	m.r[0] = 0x1303ff0f;
+	dev_t dev = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && su.host_owned && su.ready && dev);
+	CHECK(m.hce_enables == 1 && !m.hce_pending && !m.hce_echo_reads && m.hce_init_reads >= 2);
+	CHECK(m.hce_completed - m.hce_start == 6000000);
+	CHECK(m.commands && m.smcs == 1 && !m.writes && !m.syncs);
+	passed(case_name);
+
+	case_name = "already-enabled Samsung host is not restarted";
+	reset_model(true, 4096); m.r[0x34 / 4] = 1;
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && !m.hce_enables && m.commands && !m.writes);
+	passed(case_name);
+
+	case_name = "HCS upper power-change status does not replace readiness bits";
+	for (unsigned power = 0; power < 3; power++) {
+		reset_model(true, 4096);
+		m.hce_hcs = m.r[0x30 / 4] = (power << 8) | 0xf;
+		CHECK(sweet_ufs_rootdev(&dev) == 0 && m.hce_enables == 1);
+	}
+	passed(case_name);
+
+	static const char *ready[] = { "device", "transfer", "task", "UIC" };
+	for (unsigned enabled = 0; enabled < 2; enabled++) {
+		for (unsigned bit = 0; bit < 4; bit++) {
+			case_name = ready[bit];
+			reset_model(true, 4096); m.r[0x34 / 4] = enabled;
+			m.r[0x30 / 4] &= ~(1u << bit);
+			CHECK(sweet_ufs_rootdev(&dev) == ENXIO && !su.ready && !su.host_owned);
+			CHECK(!m.mmio_writes && !m.hce_enables && !m.smcs && !m.commands);
+			passed(enabled ? "enabled host missing a readiness bit" : "HCE=0 missing a readiness bit, no enable");
+		}
+	}
+	for (unsigned bit = 4; bit < 8; bit++) {
+		case_name = "Samsung HCS low-byte error/reserved bit is not ready";
+		reset_model(true, 4096); m.r[0x30 / 4] |= 1u << bit;
+		CHECK(sweet_ufs_rootdev(&dev) == ENXIO && !m.mmio_writes && !m.hce_enables);
+		passed(case_name);
+	}
+	static const unsigned error_bits[] = { 2, 7, 11, 12, 16, 17, 18 };
+	for (unsigned i = 0; i < sizeof(error_bits) / sizeof(error_bits[0]); i++) {
+		case_name = "inherited error IS is not cleared and ignored";
+		reset_model(true, 4096); m.r[0x20 / 4] = 1u << error_bits[i];
+		CHECK(sweet_ufs_rootdev(&dev) == EIO && !m.mmio_writes && !m.hce_enables && !m.smcs);
+		CHECK(m.r[0x20 / 4] == 1u << error_bits[i]);
+		passed(case_name);
+	}
+	case_name = "inherited UIC command-complete IS is not a host error";
+	reset_model(true, 4096); m.r[0x20 / 4] = 1u << 10;
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && m.hce_enables == 1 && m.commands && !m.writes);
+	passed(case_name);
+
+	for (unsigned error = 0; error < 2; error++) {
+		case_name = error ? "fatal IS during list stop prevents enable" : "readiness lost during list stop prevents enable";
+		reset_model(true, 4096);
+		m.stop_readiness_loss = !error; m.stop_host_error = error;
+		CHECK(sweet_ufs_rootdev(&dev) == (error ? EIO : ENXIO));
+		CHECK(!m.hce_enables && !m.smcs && !m.base_writes && !m.commands);
+		passed(case_name);
+	}
+	for (unsigned bit = 0; bit < 4; bit++) {
+		case_name = "enable loses device/list/UIC readiness, no cold link init";
+		reset_model(true, 4096); m.hce_hcs &= ~(1u << bit);
+		CHECK(sweet_ufs_rootdev(&dev) == ENXIO && su.dead && !su.host_owned && !su.ready);
+		CHECK(m.hce_enables == 1 && !m.smcs && !m.base_writes && !m.commands);
+		passed(case_name);
+	}
+	case_name = "fatal IS after enable prevents FMP or DMA";
+	reset_model(true, 4096); m.hce_is = 0x10000;
+	CHECK(sweet_ufs_rootdev(&dev) == EIO && su.dead && !m.smcs && !m.base_writes && !m.commands);
+	passed(case_name);
+	for (unsigned state = 0; state < 4; state++) {
+		case_name = "request/list state changes after enable, no FMP or DMA";
+		reset_model(true, 4096);
+		switch (state) {
+		case 0: m.hce_dbr = 2; break;
+		case 1: m.hce_tm_dbr = 2; break;
+		case 2: m.hce_rsr = 1; break;
+		case 3: m.hce_tm_rsr = 1; break;
+		}
+		CHECK(sweet_ufs_rootdev(&dev) == EBUSY && su.dead && !su.host_owned && !su.ready);
+		CHECK(m.hce_enables == 1 && !m.smcs && !m.base_writes && !m.commands);
+		passed(case_name);
+	}
+	static const uint64_t latency[] = { 0, 1000000, 50000000, 51000000, 51000001 };
+	for (unsigned i = 0; i < sizeof(latency) / sizeof(latency[0]); i++) {
+		case_name = "HCE write-echo guard and bounded 1 ms + ten 5 ms wait";
+		reset_model(true, 4096); m.hce_latency = latency[i];
+		bool completes = i < 4;
+		CHECK(sweet_ufs_rootdev(&dev) == (completes ? 0 : ETIMEDOUT));
+		CHECK(m.hce_enables == 1 && !m.hce_echo_reads);
+		CHECK(completes ? m.hce_completed - m.hce_start >= 1000000 &&
+		    m.hce_completed - m.hce_start <= 51000000 : m.now - m.hce_start == 51000000);
+		if (!completes) {
+			CHECK(su.dead && !m.smcs && !m.base_writes && !m.commands);
+			unsigned accesses = m.mmio_reads + m.mmio_writes;
+			uint32_t dma_crc = crc32(0, m.dma, m.size);
+			m.now += 1000000; model_enable_progress(); /* host completes too late */
+			CHECK(!m.hce_pending && (m.r[0x34 / 4] & 1));
+			CHECK(sweet_ufs_rootdev(&dev) == ETIMEDOUT && ufs_read_capacity() == EIO);
+			CHECK(m.hce_enables == 1 && accesses == m.mmio_reads + m.mmio_writes);
+			CHECK(crc32(0, m.dma, m.size) == dma_crc && !m.commands);
+		}
+		passed(case_name);
+	}
+	case_name = "Qualcomm HCE=0 still fails without an enable write";
+	reset_model(false, 4096); m.r[0x34 / 4] = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == ENXIO && !m.mmio_writes && !m.hce_enables && !m.smcs && !m.commands);
+	passed(case_name);
+}
+
 static void test_takeover(void)
 {
-	static const char *names[] = { "disabled HCE", "missing device", "host not ready",
+	static const char *names[] = { "HCE enable timeout", "missing device", "host not ready",
 	    "inherited transfer", "inherited task", "transfer list will not stop",
 	    "task list will not stop", "request arrives during stop", "SMC rejected",
 	    "PRDT setup rejected", "list base rejected", "list start rejected" };
@@ -717,9 +878,9 @@ static void test_takeover(void)
 		case_name = names[i];
 		reset_model(true, 4096);
 		switch (i) {
-		case 0: m.r[0x34 / 4] = 0; break;
-		case 1: m.r[0x30 / 4] = 2; break;
-		case 2: m.r[0x30 / 4] = 1; break;
+		case 0: m.hce_stuck = true; break;
+		case 1: m.r[0x30 / 4] &= ~1u; break;
+		case 2: m.r[0x30 / 4] &= ~2u; break;
 		case 3: m.r[0x58 / 4] = 4; break;
 		case 4: m.r[0x78 / 4] = 2; break;
 		case 5: m.stop_stuck = true; break;
@@ -738,6 +899,8 @@ static void test_takeover(void)
 		CHECK(sweet_ufs_rootdev(&dev) == error);
 		CHECK(accesses == m.mmio_reads + m.mmio_writes && m.maps == 1);
 		if (i < 8) { CHECK(!m.smcs && !m.base_writes); }
+		if (i >= 1 && i < 8) { CHECK(!m.hce_enables); }
+		if (i >= 1 && i <= 4) { CHECK(!m.mmio_writes); }
 		if (i < 10) { CHECK(!m.base_writes); }
 		passed(case_name);
 	}
@@ -1019,12 +1182,16 @@ static void test_init_bsd(void)
 	free(data);
 	passed(case_name);
 
-	for (unsigned i = 0; i < 3; i++) {
-		case_name = i == 0 ? "successful probe holds before BSD registration" :
-		    i == 1 ? "failed host probe holds" : "early handoff failure holds";
+	static const char *holds[] = { "successful probe holds before BSD registration",
+	    "HCE timeout probe holds", "early handoff failure holds",
+	    "post-enable readiness failure holds", "post-enable host error holds" };
+	for (unsigned i = 0; i < sizeof(holds) / sizeof(holds[0]); i++) {
+		case_name = holds[i];
 		reset_model(true, 4096); arg("ufsprobe", 1); m.expect_hold = true;
-		if (i == 1) { m.r[0x34 / 4] = 0; }
+		if (i == 1) { m.hce_stuck = true; }
 		if (i == 2) { set_pair("dma-pool", 0, 0); }
+		if (i == 3) { m.hce_hcs &= ~1u; }
+		if (i == 4) { m.hce_is = 0x10000; }
 		if (!setjmp(hold)) { dev_t dev; (void)sweet_ufs_rootdev(&dev); CHECK(false); }
 		CHECK(!su.ready && !m.bdevs && !m.cdevs && !m.nodes && !m.writes && !services && !sweet_ufs_lock);
 		passed(case_name);
@@ -1116,6 +1283,7 @@ int main(int argc, char **argv)
 		fclose(f);
 	}
 	test_transport();
+	test_enable();
 	test_takeover();
 	test_failures();
 	test_capacity();

@@ -208,10 +208,16 @@ device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**93 host scenarios** exercise:
+**135 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
+* The photographed HCE=0 / HCS=0x10f state, already-enabled hosts, all four
+  readiness bits, low-byte error/reserved bits, and inherited error status.
+  One enable-only attempt requires stopped/idle lists; a 1 ms write-echo guard
+  and at most ten 5 ms delays cover immediate/transitional completion, timeout
+  and late completion. Readiness/error/list-state loss prevents FMP and commands.
+  MMIO write allowlists exclude blind PHY/clock/reset or UIC command writes.
 * Read-only opcode enforcement even with `ufsrw=1`, timeout-clear polarity,
   late-DMA quarantine, initialization-failure caching, response validation,
   partial-transfer rejection and bounded transient retries.

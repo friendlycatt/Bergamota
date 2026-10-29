@@ -171,7 +171,11 @@ def main():
                                     stdout=log, stderr=subprocess.STDOUT)
         state['host'] = dict(command=list(map(str, cmd)), returncode=result.returncode)
         assert result.returncode == 0, f'see {out}/host.log'
-        print((out / 'host.log').read_text().splitlines()[-1])
+        last_line = (out / 'host.log').read_text().splitlines()[-1]
+        matched = re.fullmatch(r'PASS UFS host: (\d+) scenarios, byte-level protocol/DMA checks, ASan/UBSan', last_line)
+        assert matched, last_line
+        state['host']['scenarios'] = int(matched[1])
+        print(last_line)
         state['adt'] = loader_checks(out)
         state['real_headers'] = headers.compile_source(args.xnu.resolve(), args.headers.resolve(),
                                                        'bsd/dev/sweet_ufs.c', out / 'sweet_ufs.o')

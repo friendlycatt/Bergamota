@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -33,7 +33,9 @@
+  * Its DMA32 arena is handed off inside Enxerto's loaded Image, outside XNU
+  * RAM, and mapped Normal non-cacheable. Samsung needs byte-based UTRD
+  * fields, 128-byte FMP-bypass PRDT entries, Nexus setup and positive-bit
+- * list clearing. A timed-out Exynos host is never retried or its DMA reused.
++ * list clearing. An inherited ready/idle host with HCE=0 gets one bounded
++ * enable-only attempt, never a blind PHY/link reset. Readiness must survive
++ * enabling. A timed-out Exynos host is never retried or its DMA reused.
+  * ufsprobe=1 holds the final read-only probe result before any root mount.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -103,10 +105,17 @@
+ #define EXYNOS_TXPRDT   0x00
+ #define EXYNOS_RXPRDT   0x04
+ #define EXYNOS_NEXUS    0x40
++#define EXYNOS_SW_RST   0x50
++#define EXYNOS_GPIO     0x70
++#define EXYNOS_CLKSTOP  0xb0
++#define EXYNOS_FORCEHCS 0xb4
+ #define EXYNOS_PRD_SIZE 128u
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
++#define HCS_UTMRLRDY    (1u << 2)
++#define HCS_UCRDY       (1u << 3)
++#define HCS_EXYNOS_RDY  (HCS_DP | HCS_UTRLRDY | HCS_UTMRLRDY | HCS_UCRDY)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
+ #define UFS_BLOCK       (su.block_size)        /* immutable after root discovery */
+@@ -922,10 +931,79 @@
+ }
+ 
+ static int
++exynos_enable_inherited_host(void)
++{
++	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	/* Samsung ufshcd_get_lists_status() requires bits 1..3 set and
++	 * bits 4..7 clear; add Device Present. Upper power status is separate.
++	 */
++	if ((hcs & 0xffu) != HCS_EXYNOS_RDY) {
++		printf("STARLTE UFS: readiness changed before enable (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		return ENXIO;
++	}
++	if (ufs_rd(REG_UTRLDBR) || ufs_rd(REG_UTMRLDBR) ||
++	    ((ufs_rd(REG_UTRLRSR) | ufs_rd(REG_UTMRLRSR)) & 1u)) {
++		printf("STARLTE UFS: request state changed before enable\n");
++		return EBUSY;
++	}
++	if (ufs_rd(REG_IS) & UFS_IS_ERR_MASK) {
++		printf("STARLTE UFS: host error after list stop (is 0x%x)\n", ufs_rd(REG_IS));
++		return EIO;
++	}
++	if (!(hce & 1u)) {
++		/* Exynos9810's pinned driver does not select USE_OF_HCE. Follow
++		 * __ufshcd_hba_enable(): write 1, allow the 1->0->1 initialization
++		 * transition for 1 ms, then at most ten 5 ms delays. Do not accept
++		 * the immediate write echo as completed initialization.
++		 * This is NOT cold-host initialization: preserve the inherited
++		 * vendor/PHY configuration. HCE initialization may invalidate the
++		 * link; if readiness disappears, stop rather than blindly applying
++		 * PHY calibration or DME_LINKSTARTUP.
++		 */
++		printf("STARLTE UFS: HCE enable-only attempt (inherited ready, idle lists)\n");
++		ufs_wr(REG_HCE, 1);
++		__builtin_arm_dsb(0xf);
++		delay(1000);
++		for (unsigned retry = 0; retry < 10 && !(ufs_rd(REG_HCE) & 1u); retry++) {
++			delay(5000);
++		}
++		hce = ufs_rd(REG_HCE);
++		hcs = ufs_rd(REG_HCS);
++		printf("STARLTE UFS: HCE enable result hce 0x%x hcs 0x%x is 0x%x\n",
++		    hce, hcs, ufs_rd(REG_IS));
++		if (!(hce & 1u)) {
++			su.dead = true;
++			return ETIMEDOUT;
++		}
++	}
++	if (!(hce & 1u) || (hcs & 0xffu) != HCS_EXYNOS_RDY) {
++		printf("STARLTE UFS: enable-only lost readiness; cold link init not attempted\n");
++		su.dead = true;
++		return ENXIO;
++	}
++	if (ufs_rd(REG_IS) & UFS_IS_ERR_MASK) {
++		printf("STARLTE UFS: host error after list stop/enable (is 0x%x)\n", ufs_rd(REG_IS));
++		su.dead = true;
++		return EIO;
++	}
++	if (ufs_rd(REG_UTRLDBR) || ufs_rd(REG_UTMRLDBR) ||
++	    ((ufs_rd(REG_UTRLRSR) | ufs_rd(REG_UTMRLRSR)) & 1u)) {
++		printf("STARLTE UFS: request state changed after enable\n");
++		su.dead = true;
++		return EBUSY;
++	}
++	return 0;
++}
++
++static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
++	/* Exynos checks HCE again after stopping both lists, enabling it only
++	 * if the inherited ready/idle state permits. Qualcomm is unchanged.
++	 */
++	if (su.exynos ? (hcs & 0xffu) != HCS_EXYNOS_RDY :
++	    (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY))) {
+ 		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		return ENXIO;
+ 	}
+@@ -933,6 +1011,10 @@
+ 		printf("SWEET UFS: requests outstanding from the bootloader\n");
+ 		return EBUSY;
+ 	}
++	if (su.exynos && (ufs_rd(REG_IS) & UFS_IS_ERR_MASK)) {
++		printf("STARLTE UFS: inherited host error (is 0x%x)\n", ufs_rd(REG_IS));
++		return EIO;
++	}
+ 	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
+ 	if (((su.dma_pa + su.dma_size - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
+ 		printf("SWEET UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
+@@ -954,6 +1036,8 @@
+ 			printf("STARLTE UFS: request lists did not stop\n");
+ 			return EBUSY;
+ 		}
++		int error = exynos_enable_inherited_host();
++		if (error) { return error; }
+ 		uint64_t result = exynos_fmp_format();
+ 		printf("STARLTE UFS: FMP DESCTYPE 3 result 0x%llx, TX/RX 0x%x/0x%x nexus 0x%x\n",
+ 		    result, exynos_rd(EXYNOS_TXPRDT), exynos_rd(EXYNOS_RXPRDT), exynos_rd(EXYNOS_NEXUS));
+@@ -1458,6 +1542,14 @@
+ 	printf("SWEET UFS: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x is 0x%x utrlba 0x%x:%x dbr 0x%x rsr 0x%x\n",
+ 	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_CAP), ufs_rd(0x08), ufs_rd(REG_IS),
+ 	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR));
++	if (su.exynos) {
++		printf("STARLTE UFS: inherited tm dbr 0x%x rsr 0x%x, TX/RX 0x%x/0x%x nexus 0x%x\n",
++		    ufs_rd(REG_UTMRLDBR), ufs_rd(REG_UTMRLRSR),
++		    exynos_rd(EXYNOS_TXPRDT), exynos_rd(EXYNOS_RXPRDT), exynos_rd(EXYNOS_NEXUS));
++		printf("STARLTE UFS: inherited swrst 0x%x gpio 0x%x clkstop 0x%x force 0x%x\n",
++		    exynos_rd(EXYNOS_SW_RST), exynos_rd(EXYNOS_GPIO),
++		    exynos_rd(EXYNOS_CLKSTOP), exynos_rd(EXYNOS_FORCEHCS));
++	}
+ 	if (!su.exynos) {
+ 		kern_return_t kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
+ 		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
