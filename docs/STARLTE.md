@@ -4,12 +4,13 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F-class hardware),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-29:** the full XNU26 CI build succeeded. The user's first
-physical test remains on a **plain Samsung logo**, with no visible Enxerto
-output. QEMU executes VM, CPU and IOKit initialization with readable verbose
-diagnostics. [Display probe 1](#display-probe-1) is ready for the next test.
-Samsung storage, touch, Mali GPU, USB and power-management support remain
-follow-up work.
+**Status, 2026-10-29:** the physical [display probe](#display-probe-1) reaches
+**PROBE READY** with readable Enxerto diagnostics and an RGB strip. The
+[XNU-enabled refresh image](#xnu-enabled-refresh-image) is verified and ready
+for the next hardware test. The full XNU26 CI build succeeded; QEMU executes
+VM, CPU and IOKit initialization with readable verbose diagnostics. Physical
+XNU execution, timer delivery, Samsung storage, touch, Mali GPU, USB and
+power-management support remain follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The new kernel work is
@@ -27,9 +28,11 @@ The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
   `7a2ada19841a129f86fb791c0b9a710436c849a4`. Its starlte firmware-port
   sources provide the framebuffer and upper-bank RAM references.
 
-These are public reference-device facts. The constants in
-[`tools/mkadt.py`](../tools/mkadt.py) and [`enxerto/board.h`](../enxerto/board.h)
-still need comparison with the live device.
+These are public reference-device facts used by
+[`tools/mkadt.py`](../tools/mkadt.py) and [`enxerto/board.h`](../enxerto/board.h).
+The physical probe now corroborates the selected framebuffer base/geometry
+and the upper RAM bank advertised by the live FDT. Complete allocation
+ownership and interrupt delivery still need device validation.
 
 | Item | Current value | Source |
 | --- | --- | --- |
@@ -42,22 +45,26 @@ still need comparison with the live device.
 | Scanout geometry | 1440×2960, 32-bit; assumed tightly packed stride 5760 bytes | [Mu `starlte.dsc`][mu-board] |
 | Nominal CPU metadata | LITTLE 1,794,000,000 Hz; big 1,924,000,000 Hz | Samsung DTS cpufreq table entry `0x1b5fd0`, big-core `policy-max` / `pm_qos-booting = <0x1d5ba0>` (kHz), lines 10778–10800 |
 
-Important unresolved hardware details:
+Hardware observations and remaining gaps:
 
 * **Timer delivery:** Samsung's timer node also sets `use-clocksource-only`
   and `use-physical-timer`. [Mu's SoC configuration][mu-soc] selects
   `USE_PHYSICAL_TIMER=1`, `HAS_CNTFRQ_EL0_EMPTY_ERRATA=1` and
   `PcdTimerFreqOverwrite|26000000`. The XNU path currently uses CNTV and
-  INTID 27. Its delivery and the live `CNTFRQ_EL0` value need measurement.
+  INTID 27. The photograph shows **`CNTFRQ_EL0=0`**; XNU's
+  `pe_identify_machine()` already reads the ADT's **26 MHz**
+  `timebase-frequency`. Actual virtual-timer interrupt delivery remains
+  untested. The normal loader's optional CNTFRQ-based `BOOTPAUSE` is disabled.
 * **Display refresh:** [Mu `PlatformSec.c`][mu-sec] programs DECON
-  `HW_SW_TRIG_CONTROL = 0x1281` at `0x16030070`. Enxerto now attempts this
-  when the live FDT root identifies Exynos9810. Successful register or
-  framebuffer RAM writes alone do not establish physical panel refresh.
-  The active window address, stride, format, IOMMU state and trigger mode
-  need capture from the S9.
-* **RAM ownership:** the upper-bank reference is a candidate allocation,
-  not a measurement of this phone's usable RAM. Fixed reservations and
-  firmware/dynamic allocations must be accounted for. In particular,
+  `HW_SW_TRIG_CONTROL = 0x1281` at `0x16030070`. Enxerto applies this when
+  the live FDT root identifies Exynos9810. The physical probe shows readable
+  output, trigger readback `0x3070 -> 0x1001` and frame count `2 -> 9`.
+  IDMA0 reports base `0xcc000000` and 1440×2960 source geometry. Full
+  stride/format/IOMMU interpretation and sustained XNU display operation
+  remain to be validated; frame samples have no calibrated interval.
+* **RAM ownership:** the live FDT advertises the selected
+  `0x880000000 + 0x80000000` bank. Fixed reservations and firmware/dynamic
+  allocations still must be accounted for. In particular,
   Samsung's DTS reserves `0xf0000000 + 0x09200000` for `modem_if`; the old
   manually chosen payload address `0xf0000000` conflicts with that region.
 * **CPU metadata:** frequency values are table/policy metadata, not measured
@@ -107,10 +114,46 @@ The runner checks that its ADT agrees with QEMU's MMIO and CPU layout.
 
 ## Build artifacts and Samsung handoff
 
+### XNU-enabled refresh image
+
+**Current test image:** `enxerto/out/starlte/boot-starlte-xnu26-refresh.img`,
+**9369616 bytes**, with adjacent `.img.sha256`. SHA256:
+
+```text
+f9c6df75c666d11d0e5ff06a29c581c7092ff5204d0183d55803406f3ca398d6
+```
+
+Built with `BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1` and
+`STARLTE_DISPLAY_PROBE=0`, this enables normal XNU loading and retains the
+DECON setup that produced the successful physical probe. The loader source
+is `e4d521886d338a953c6c3476d77702979e11451d`; its Image and ELF are
+byte-identical to the four passing normal GICv2/v3 × EL1/EL2 loader handoffs.
+The 655360-byte Image has SHA256
+`2831c1de7055c858684ccd5cb9a664cda8fb78362d2d254f14f8cb2140777fa8`.
+
+It uses the existing kernel from CI run **40826795487** and the unchanged
+8406896-byte verbose hardware payload, SHA256
+`6d5ce738b6562ced9fa93452b070cb53c97ef5fc5cee554f3a626e8d590a70e4`.
+Arguments remain:
+
+```text
+-v sweetearlyfb=1 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam
+```
+
+Independent verification confirms the exact loader/payload sections,
+preserved template metadata/second stage/DTBH/footer and legacy SHA-1.
+`research/starlte/xnu26-refresh-delivery/` contains the image, loader,
+verification, provenance, photograph observations, README and ten-file
+`SHA256SUMS`. These artifacts are local and ignored by git.
+
+For the next user-controlled recovery test, install this image to **Boot**
+through TWRP / OrangeFox and photograph the last visible screen after reboot.
+Physical XNU startup is pending; the image includes no iOS root filesystem.
+
 ### Initial full-kernel image
 
-The user tested this image and reported the plain Samsung logo. The current
-diagnostic image is [display probe 1](#display-probe-1).
+The user tested this image and reported the plain Samsung logo. It is
+preserved alongside the current [refresh image](#xnu-enabled-refresh-image).
 
 Local image: **`enxerto/out/starlte/boot-starlte-xnu26-verbose.img`**,
 **9369616 bytes**. SHA256:
@@ -154,12 +197,13 @@ payload path passed to `build.sh` is copied to `out/starlte/payload.bin`.
 The raw ARM64 Image is position-independent and includes its BSS/stacks.
 [`tools/mkboot-starlte.py`](../tools/mkboot-starlte.py) wraps it and a
 SWEETXNU payload using the legacy Samsung layout described below. The
-device's actual bootloader handoff remains to be tested.
+physical probe established loader entry and live placement; the XNU
+handoff on the S9 remains to be tested.
 
 The implemented entry contract is:
 
 1. A Linux-style AArch64 handoff, with `x0` pointing to a readable physical
-   FDT, translation and D-cache already off. Non-secure EL1 and bare EL2 are
+   FDT and translation off. Non-secure EL1 and bare EL2 are
    supported; the EL2 path drops to EL1. A resident hypervisor is outside
    this contract.
 2. A 16 KiB-granule-capable CPU. Enxerto's temporary mapping has a 64 GiB
@@ -176,6 +220,13 @@ The implemented entry contract is:
 5. The final jump enters the payload at EL1, with MMU/I-cache/D-cache off,
    interrupts masked and `x0 = boot_args` physical address. The embedded
    Apple Device Tree is separate from the incoming Linux FDT.
+
+The probe photograph shows incoming/current `SCTLR=0x30c5183e`: M is clear,
+while C and I are set. The earlier assumption of cache-enable bits being
+clear does not match this observation. `mmu_enable_ranges()` invalidates
+the image, payload and destination ranges plus the instruction cache before
+enabling its mappings. The physical probe holds before that mapping/loading
+path; the refresh image is the next test of it.
 
 Starlte defaults to XNU26's **1024-byte** boot_args CommandLine: structure
 size 1152, `bootFlags` at 1136, `memSizeActual` at 1144. Existing Enxerto
@@ -198,8 +249,9 @@ are not observations of the bootloader's actual RAM placement.
 The DTBH has one Exynos9810 entry, hardware revisions 26–255, containing a
 301372-byte FDT. Its `/chosen` contains placeholder initrd properties
 `0x82000000` / `0x821fffff`; the bootloader must supply the actual payload
-extent at handoff. This template has no `/memory` node and does not resolve
-the live RAM/scanout questions above.
+extent at handoff. This template has no `/memory` node. The later physical
+probe reports live initrd `0x89000000..0x89804770` and the selected upper
+RAM bank, showing that the bootloader supplies additional live FDT data.
 
 Using the downloaded full kernel, rebuild a verbose single-core image with
 the current loader (the original delivered image above is preserved):
@@ -208,7 +260,7 @@ the current loader (the original delivered image above is preserved):
 python3 tools/mkpayload.py xnu/out-starlte/kernel.development.sweet \
     research/starlte/starlte.adt research/starlte/payload-verbose.bin --compress \
     --cmdline '-v sweetearlyfb=1 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam'
-BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 enxerto/build.sh
+BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 STARLTE_DISPLAY_PROBE=0 enxerto/build.sh
 python3 tools/mkboot-starlte.py /path/to/lineage-starlte/boot.img \
     enxerto/out/starlte/Image research/starlte/payload-verbose.bin \
     enxerto/out/starlte/boot-starlte-xnu26-rebuild.img
@@ -261,8 +313,8 @@ The reconstruction uses XNU `xnu-12377.121.6` at
 `663906528d1cd5ea8fde7de6f16de73db9511549`.
 The freestanding guests establish component behavior. The full-kernel
 observations below extend this to QEMU startup execution. The physical
-attempt has no evidence of Enxerto/XNU entry; an iOS root/userland boot
-has not been established.
+probe establishes Enxerto entry and visible panel refresh. Physical XNU
+execution and an iOS root/userland boot have not been established.
 
 ## Full-kernel build and QEMU observations
 
@@ -321,19 +373,20 @@ The user reports installing `boot-starlte-xnu26-verbose.img` through
 **plain Samsung logo, nothing else**. The selected partition was not
 explicitly reported. No agent device writes were performed.
 
-There is no observation yet that distinguishes failure to enter Enxerto,
+That image's logo alone did not distinguish failure to enter Enxerto,
 an early loader stop, or framebuffer writes that never refresh the panel.
-The delivered loader lacks Mu-Silicium's DECON trigger setup; that is a
-concrete difference to probe, not a confirmed diagnosis.
+It lacked Mu-Silicium's DECON trigger setup. The later probe below adds
+that setup and establishes readable physical output; the exact cause of
+the original attempt's lack of output was not isolated.
 
 Enxerto logs to the framebuffer and XNU has a volatile RAM ring. There is
 no persistent S9 log file in this image; recovery `last_kmsg` / `pstore`
-cannot reliably recover this attempt's output. The phone is not currently
-in recovery, and the user asked to proceed without further recovery checks.
+cannot reliably recover this attempt's output. The user asked to proceed
+without further recovery checks.
 
 ### Display probe 1
 
-**Current test image:** `enxerto/out/starlte/boot-starlte-display-probe-1.img`,
+**Tested probe image:** `enxerto/out/starlte/boot-starlte-display-probe-1.img`,
 **9369616 bytes**, with adjacent `.img.sha256`. SHA256:
 
 ```text
@@ -342,7 +395,8 @@ in recovery, and the user asked to proceed without further recovery checks.
 
 Loader source: `e4d521886d338a953c6c3476d77702979e11451d`. It reuses the
 verbose hardware payload and kernel from CI run **40826795487**. The
-physical result for this probe is **pending**.
+user's photograph confirms **PROBE READY**, readable text and the RGB strip.
+`XNU loading disabled` is the intentional pre-XNU hold.
 
 Build a probe around the existing verbose hardware payload:
 
@@ -350,7 +404,7 @@ Build a probe around the existing verbose hardware payload:
 BOARD=starlte BOOT_ARGS_LINE_LENGTH=1024 BOOTLOG=1 STARLTE_DISPLAY_PROBE=1 enxerto/build.sh
 python3 tools/mkboot-starlte.py /path/to/lineage-starlte/boot.img \
     enxerto/out/starlte/Image research/starlte/delivery-40826795487/payload-verbose.bin \
-    enxerto/out/starlte/boot-starlte-display-probe-1.img
+    enxerto/out/starlte/boot-starlte-display-probe-1-rebuild.img
 ```
 
 It first paints a cyan strip, checks the incoming FDT identity, and applies
@@ -366,8 +420,8 @@ Image is 655360 bytes, SHA256
 `research/starlte/display-probe-1-check/` contains 12 host-load results,
 24 root-compatible cases, four full-loader handoffs and two probe holds.
 The QEMU probe screenshots show the held diagnostics and RGB strip, with
-the destination sentinel intact. Samsung display MMIO is skipped there;
-the actual register write/readback and physical refresh remain untested.
+the destination sentinel intact. Samsung display MMIO is skipped in QEMU;
+the physical photograph supplies the register/refresh observations below.
 
 Independent packaging verification passes: the kernel section is exactly
 the QEMU-checked probe Image, the payload is unchanged, and template header
@@ -383,29 +437,46 @@ have no fixed time interval; equal samples do not establish a stalled panel.
 The only display-register write is `0x1281` to `0x16030070`; IDMA bases,
 formats, window selection and IOMMU state are reported rather than changed.
 
-On the next user-controlled recovery test, the image target is **Boot**.
-Photograph the held diagnostics if they appear. A continued plain Samsung
-logo still does not distinguish loader entry from an unrefreshed/wrong
-framebuffer; the next step is actual placement/display evidence and an
-installed-partition check when recovery is available.
+**Physical observations, 2026-10-29:** manually transcribed from the user's
+photograph, rather than a binary register/FDT dump:
+
+| Field | Visible value |
+| --- | --- |
+| Entry/current EL | EL1 / EL1 |
+| Incoming/current SCTLR | `0x30c5183e` (M clear, C/I set) |
+| MPIDR | `0x81000000` |
+| CNTFRQ_EL0 | `0` |
+| Loader Image | `0x80098000..0x80138000` |
+| FDT | `0x8a000000` |
+| Initrd | `0x89000000..0x89804770` (8406896 bytes, exactly the verbose payload size) |
+| DECON trigger readback | `0x3070 -> 0x1001` after the `0x1281` write |
+| Frame count | `2 -> 9` |
+| IDMA0 base/source size | `0xcc000000` / `0x0b9005a0` (1440×2960) |
+| Selected RAM bank in live FDT | `0x880000000 + 0x80000000` |
+
+Full manual transcription stays ignored in
+`research/starlte/device-probe-1/observation.json`. The held probe establishes
+loader/display progress; XNU execution, timer interrupt delivery and full
+RAM ownership remain open. The next image is the
+[XNU-enabled refresh build](#xnu-enabled-refresh-image).
 
 ## Next milestones
 
-1. **Early display probe.** Apply the pinned DECON trigger setup and hold
-   visible entry/register diagnostics before XNU loading. Obtain the user's
-   result; a continued logo leaves entry and scanout unresolved.
-2. **Live handoff facts.** Obtain the bootloader state, running FDT,
-   RAM/reservations, actual image placement, incoming EL,
-   timer behavior and active DECON configuration. Keep dumps and device
-   identifiers under ignored `research/`, `dtb/` or `backup/` paths.
-3. **Single-core device progress.** Test the verbose image and capture the
-   last visible screen. Establish temporary loading, visible
-   diagnostics and timer interrupts, then validate CPU_ON/IPIs on the real
-   affinities. Device writes require the confirmations in `AGENTS.md`.
+1. **Single-core XNU device progress.** Test `boot-starlte-xnu26-refresh.img`
+   through the user's recovery route and capture the last visible screen.
+   Establish loader mapping/payload handoff and early XNU execution.
+   Device writes require the confirmations in `AGENTS.md`.
+2. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
+   CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
+   observed zero `CNTFRQ_EL0` register.
+3. **Complete live hardware facts.** Resolve RAM reservations/firmware
+   allocations and the inherited display's stride/format/IOMMU state.
+   Keep dumps and device identifiers under ignored `research/`, `dtb/`
+   or `backup/` paths.
 4. **Console follow-up.** Complete framebuffer-serial initialization when
    it is the only registered interface; teach QEMU diagnostics to account
    for the themed video console or consume the captured log ring.
-5. **Samsung peripherals and root boot.** Storage, display refresh, USB,
+5. **Samsung peripherals and root boot.** Storage, sustained display, USB,
    input and power support are needed before an iOS userland boot can be
    claimed; Mali acceleration is a separate hardware-driver effort.
 
