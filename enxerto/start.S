@@ -1,6 +1,6 @@
 /*
- * Enxerto entry: arm64 Linux Image header so Qualcomm ABL treats
- * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * Enxerto entry: arm64 Linux Image header for the Android bootloader.
+ * MMU/D-cache off, x0 = DTB pointer; starlte also accepts bare EL2.
  */
 	.section .text.head, "ax"
 	.globl _head
@@ -21,6 +21,17 @@ _head:
 _start:
 	msr	daifset, #0xf
 #if defined(BOARD_STARLTE)
+	/* Preserve the incoming EL/control state across the optional EL2 drop
+	 * and BSS clearing. starlte_enter_el1 only clobbers x1 and x30.
+	 */
+	mrs	x20, CurrentEL
+	cmp	x20, #8
+	b.ne	.Lentry_sctlr_el1
+	mrs	x21, sctlr_el2
+	b	.Lentry_context_ready
+.Lentry_sctlr_el1:
+	mrs	x21, sctlr_el1
+.Lentry_context_ready:
 	bl	starlte_enter_el1
 #endif
 	mov	x19, x0			/* DTB pointer from ABL */
@@ -38,6 +49,10 @@ _start:
 	str	xzr, [x1], #8
 	b	1b
 2:	mov	x0, x19
+#if defined(BOARD_STARLTE)
+	mov	x1, x20
+	mov	x2, x21
+#endif
 	bl	enxerto_main
 3:	wfe
 	b	3b

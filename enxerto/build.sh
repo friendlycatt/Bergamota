@@ -34,7 +34,7 @@ OUT=out
 case $BOARD in
 sweet)		DTB=${DTB:-../dtb/boot_unpacked/dtb} ;;
 beryllium)	DTB=${DTB:-../dtb/beryllium/dtb}; CFLAGS="$CFLAGS -DBOARD_BERYLLIUM" ;;
-starlte)	CFLAGS="$CFLAGS -DBOARD_STARLTE"; OUT=out/starlte ;;
+starlte)	CFLAGS="$CFLAGS -DBOARD_STARLTE -DSTARLTE_DISPLAY_PROBE=${STARLTE_DISPLAY_PROBE:-0}"; OUT=out/starlte ;;
 *)		echo "error: unknown BOARD=$BOARD" >&2; exit 1 ;;
 esac
 if [ "$BOARD" != starlte ]; then
@@ -73,6 +73,7 @@ python3 -c "import sys; open(sys.argv[1],'r+b').truncate(int(sys.argv[2],16))" "
 if [ "$BOARD" = starlte ]; then
 	[ -z "${1:-}" ] || cp "$1" "$OUT/payload.bin"
 	echo "Built $OUT/Image (raw ARM64 Image; Samsung handoff instructions in docs/STARLTE.md)"
+	[ "${STARLTE_DISPLAY_PROBE:-0}" = 0 ] || echo "DISPLAY PROBE: holds the early diagnostics before loading XNU"
 	exit 0
 fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty

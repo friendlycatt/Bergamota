@@ -36,6 +36,67 @@ static uintptr_t skip_str(uintptr_t p)
 	return p + 1;
 }
 
+static int bounded_streq(uintptr_t p, uintptr_t end, const char *s)
+{
+	while (p < end && *s && *(const char *)p == *s)
+		p++, s++;
+	return p < end && !*s && !*(const char *)p;
+}
+
+/* Used before board-specific MMIO. Only root properties may select hardware;
+ * a child compatible, prefix match or unterminated list must not do so.
+ */
+int fdt_root_compatible(uintptr_t fdt, const char *compatible)
+{
+	if (!fdt || (fdt & 3) || be32(fdt) != FDT_MAGIC)
+		return 0;
+	uint32_t total = be32(fdt + 4);
+	if (total < 40 || total > UINTPTR_MAX - fdt ||
+	    be32(fdt + 20) < 17 || be32(fdt + 24) > 17)
+		return 0;
+	uint32_t so = be32(fdt + 8), ss = be32(fdt + 36);
+	uint32_t no = be32(fdt + 12), ns = be32(fdt + 32);
+	if (so < 40 || (so & 3) || so > total || ss > total - so ||
+	    no < 40 || no > total || ns > total - no)
+		return 0;
+	uintptr_t p = fdt + so, end = p + ss;
+	uintptr_t strings = fdt + no, strings_end = strings + ns;
+	while (end - p >= 4 && be32(p) == FDT_NOP)
+		p += 4;
+	/* FDT root name is empty, padded to four bytes. */
+	if (end - p < 8 || be32(p) != FDT_BEGIN_NODE || *(const char *)(p + 4))
+		return 0;
+	p += 8;
+	while (end - p >= 4) {
+		uint32_t tok = be32(p);
+		p += 4;
+		if (tok == FDT_NOP)
+			continue;
+		if (tok != FDT_PROP || end - p < 8)
+			return 0;
+		uint32_t len = be32(p), nameoff = be32(p + 4);
+		p += 8;
+		uintptr_t padded = ((uintptr_t)len + 3) & ~3UL;
+		if (padded > end - p || nameoff >= ns)
+			return 0;
+		if (bounded_streq(strings + nameoff, strings_end, "compatible")) {
+			uintptr_t v = p, val_end = p + len;
+			int found = 0;
+			while (v < val_end) {
+				found |= bounded_streq(v, val_end, compatible);
+				while (v < val_end && *(const char *)v)
+					v++;
+				if (v == val_end)
+					return 0;
+				v++;
+			}
+			return found;
+		}
+		p += padded;
+	}
+	return 0;
+}
+
 int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 {
 	if (!fdt || be32(fdt) != FDT_MAGIC)

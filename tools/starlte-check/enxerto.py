@@ -2,9 +2,11 @@
 """Exercise Enxerto's real FDT parser, payload loader and boot_args producer on the host."""
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -35,6 +37,8 @@ def compile_host(out, board, length):
     dll.fdt_board_info.argtypes = [ctypes.c_size_t]
     dll.loader_check.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
     dll.loader_check.restype = ctypes.c_char_p
+    dll.fdt_root_compatible.argtypes = [ctypes.c_size_t, ctypes.c_char_p]
+    dll.fdt_root_compatible.restype = ctypes.c_int
     return dll
 
 
@@ -87,6 +91,58 @@ def make_fdt(out, start, end, root_size_cells, reserved_size_cells, initrd_cells
     result = run(['dtc', '-q', '-I', 'dts', '-O', 'dtb', '-o', out / 'fixture.dtb'], input=dts, capture_output=True)
     assert not result.stdout
     return (out / 'fixture.dtb').read_bytes()
+
+
+def compatible_checks(out, dll):
+    def tree(root='', child=''):
+        dts = f'/dts-v1/; / {{ {root} device {{ {child} }}; }};'
+        path = out / 'compatible.dtb'
+        run(['dtc', '-q', '-I', 'dts', '-O', 'dtb', '-o', path], input=dts, capture_output=True)
+        return path.read_bytes()
+
+    identity = 'Samsung,EXYNOS9810'
+    good = tree(f'compatible = "Samsung, Star rev26", "{identity}";')
+    cases = [
+        ('second-string', good, identity, 1),
+        ('first-string', good, 'Samsung, Star rev26', 1),
+        ('prefix', good, 'Samsung,EXYNOS981', 0),
+        ('suffix', good, 'EXYNOS9810', 0),
+        ('wrong-case', good, 'samsung,exynos9810', 0),
+        ('qemu', tree('compatible = "linux,dummy-virt";'), identity, 0),
+        ('child-only', tree(child=f'compatible = "{identity}";'), identity, 0),
+        ('missing', tree(), identity, 0),
+        ('empty-list', tree('compatible;'), identity, 0),
+        ('lowercase', tree('compatible = "samsung,exynos9810";'), 'samsung,exynos9810', 1),
+        ('longer-entry', tree(f'compatible = "{identity}-extra";'), identity, 0),
+    ]
+    struct_offset, = struct.unpack_from('>I', good, 8)
+    prop = struct_offset + 8  # Empty root name, then its first property.
+    assert struct.unpack_from('>I', good, prop)[0] == 3
+    for name, offset, value in (
+        ('bad-magic', 0, 0), ('short-header', 4, 36), ('v16', 20, 16),
+        ('unaligned-struct', 8, struct_offset + 1), ('struct-outside', 36, len(good)),
+        ('strings-outside', 32, len(good)), ('bad-nameoff', prop + 8, len(good)),
+        ('oversized-value', prop + 4, 0xffffffff),
+    ):
+        bad = bytearray(good)
+        struct.pack_into('>I', bad, offset, value)
+        cases.append((name, bytes(bad), identity, 0))
+    bad = good.replace(identity.encode() + b'\0', identity.encode() + b'X')
+    cases += [('unterminated-entry', bad, identity, 0),
+              ('matched-before-bad-tail', bad, 'Samsung, Star rev26', 0)]
+    bad = good.replace(b'compatible\0', b'compatibleX')
+    cases.append(('unterminated-name', bad, identity, 0))
+    results = []
+    for name, data, query, expected in cases:
+        buf = ctypes.create_string_buffer(data)
+        assert dll.fdt_root_compatible(ctypes.addressof(buf), query.encode()) == expected, name
+        results.append(dict(case=name, expected=expected, status='pass'))
+    buf = ctypes.create_string_buffer(good)
+    for name, address in (('null', 0), ('unaligned', ctypes.addressof(buf) + 1)):
+        assert dll.fdt_root_compatible(address, identity.encode()) == 0, name
+        results.append(dict(case=name, expected=0, status='pass'))
+    (out / 'compatible-summary.json').write_text(json.dumps(results, indent=2) + '\n')
+    print(f'PASS FDT MMIO gate: {len(results)} exact root-list / malformed input cases')
 
 
 def host_checks(out):
@@ -159,13 +215,122 @@ def host_checks(out):
             assert dll.fdt_chosen_u64(ctypes.addressof(fdt), b'linux,initrd-start', ctypes.byref(value)) == 1
             assert value.value == 0x48000000
     (out / 'host-summary.json').write_text(json.dumps(results, indent=2) + '\n')
+    compatible_checks(out, dll)
+
+
+def build_loader(out, display_probe):
+    out.mkdir(exist_ok=True)
+    env = {**os.environ, 'BOARD': 'starlte', 'BOOT_ARGS_LINE_LENGTH': '1024',
+           'BOOTLOG': '1', 'STARLTE_DISPLAY_PROBE': str(int(display_probe))}
+    env.pop('BOOTPAUSE', None)
+    run(['bash', ROOT / 'enxerto/build.sh'], env=env)
+    for name in ('Image', 'enxerto.elf'):
+        shutil.copy2(ROOT / 'enxerto/out/starlte' / name, out / name)
+    image = out / 'Image'
+    header = image.read_bytes()
+    assert header[56:60] == b'ARM\x64' and struct.unpack_from('<Q', header, 16)[0] == len(header)
+    nm = run(['llvm-nm', '--defined-only', out / 'enxerto.elf'], capture_output=True).stdout
+    symbols = {fields[2]: int(fields[0], 16) for line in nm.splitlines()
+               if len(fields := line.split()) == 3}
+    (out / 'build.json').write_text(json.dumps(dict(
+        display_probe=display_probe, image_bytes=len(header),
+        image_sha256=hashlib.sha256(header).hexdigest(),
+        flags={key: env[key] for key in ('BOARD', 'BOOT_ARGS_LINE_LENGTH', 'BOOTLOG', 'STARLTE_DISPLAY_PROBE')},
+    ), indent=2) + '\n')
+    return image, header, symbols
+
+
+def capture_console(monitor, case, header, symbols):
+    # QEMU virt places this zero-text-offset, anywhere-placement Image at
+    # RAM + 2 MiB. Assert its header before interpreting private console RAM.
+    path = case / 'loader-ram.bin'
+    qemu.qmp(str(monitor), pmemsave=(0x40200000, len(header), str(path)))
+    ram = path.read_bytes()
+    assert ram[:64] == header[:64], 'unexpected QEMU Image placement'
+    count, = struct.unpack_from('<I', ram, symbols['hist_n'])
+    lines = []
+    for i in range(max(0, count - 47), count):
+        offset = symbols['hist_ch'] + i % 48 * 64
+        lines.append(ram[offset:offset + 64].rstrip(b'\0').replace(b'\0', b' ').decode('ascii'))
+    text = '\n'.join(lines) + '\n'
+    (case / 'console.txt').write_text(text)
+    return text
+
+
+def check_entry_console(text, entry_el):
+    assert f'in={entry_el:08X} now=00000001' in text, text
+    assert 'skipped: non-Exynos FDT' in text, text
+    assert 'SCTLRin' in text and 'IMAGE   0000000040200000' in text, text
+
+
+def display_probe_checks(out, kernel):
+    image, header, symbols = build_loader(out / 'display-probe-loader', True)
+    tree = build_tree(board='starlte', qemu=True, gic_version=2, qemu_cpus=1)
+    adt_path = out / 'display-probe.adt'
+    adt_path.write_bytes(adt.serialize(tree))
+    blob, _ = mkpayload.build(kernel, adt_path, 'debug=0xc', compress=True)
+    payload = out / 'display-probe-payload.bin'
+    payload.write_bytes(blob)
+    sentinel = out / 'destination-sentinel.bin'
+    sentinel.write_bytes(b'\xa5' * PAGE)
+    results = []
+    for el2 in (False, True):
+        case = out / f'display-probe-el{2 if el2 else 1}'
+        case.mkdir(exist_ok=True)
+        monitor = case / 'qmp.sock'
+        monitor.unlink(missing_ok=True)
+        serial = case / 'serial.txt'
+        serial.write_text('')
+        cmd = ['qemu-system-aarch64', '-M', f'virt,gic-version=2,virtualization={"on" if el2 else "off"}',
+               '-cpu', 'cortex-a76', '-m', '4G', '-nographic', '-serial', f'file:{serial}',
+               '-qmp', f'unix:{monitor},server=on,wait=off', '-no-reboot',
+               '-d', 'int,guest_errors', '-D', str(case / 'qemu.log'),
+               '-kernel', str(image), '-initrd', str(payload),
+               '-device', f'loader,file={sentinel},addr=0x50000000,force-raw=on']
+        (case / 'command.json').write_text(json.dumps(cmd, indent=2) + '\n')
+        with (case / 'runner.log').open('w') as log:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 20
+                text = ''
+                while proc.poll() is None and time.monotonic() < deadline:
+                    if monitor.exists():
+                        text = capture_console(monitor, case, header, symbols)
+                        if 'READY - photograph this screen' in text:
+                            break
+                    time.sleep(0.1)
+                assert proc.poll() is None, f'{case}: QEMU exited ({proc.returncode})'
+                regs = qemu.qmp(str(monitor), 'stop', 'info registers', cpu_index=0)
+                (case / 'regs.txt').write_text(regs[-1])
+                text = capture_console(monitor, case, header, symbols)
+                assert 'DISPLAY PROBE 1' in text and 'READY - photograph this screen' in text, text
+                check_entry_console(text, 2 if el2 else 1)
+                assert 'EL1h' in regs[-1], regs[-1]
+                qemu.qmp(str(monitor), pmemsave=(0x50000000, PAGE, str(case / 'destination.bin')))
+                assert (case / 'destination.bin').read_bytes() == sentinel.read_bytes(), 'probe loaded XNU destination'
+                assert not serial.read_text(), 'probe executed the payload'
+                fb = qemu.framebuffer(blob)
+                qemu.qmp(str(monitor), pmemsave=(fb.base, fb.size, str(case / 'fb.raw')))
+                pixels = (case / 'fb.raw').read_bytes()
+                for x, expected in ((240, 0xffff0000), (720, 0xff00ff00), (1200, 0xff0000ff)):
+                    assert struct.unpack_from('<I', pixels, 32 * fb.stride + x * 4)[0] == expected
+                qemu.write_png(case / 'fb.png', pixels, fb)
+                (case / 'fb.raw').unlink()
+                errors = (case / 'qemu.log').read_text()
+                assert 'Invalid ' not in errors and 'Abort' not in errors, errors
+                results.append(dict(entry_el=2 if el2 else 1, status='pass', image_size=len(header),
+                                    framebuffer_bars='RGB', destination='untouched', samsung_mmio='skipped'))
+                print(f'PASS display probe: EL{2 if el2 else 1}, visible RGB/entry diagnostics, destination untouched')
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                monitor.unlink(missing_ok=True)
+    (out / 'display-probe-summary.json').write_text(json.dumps(results, indent=2) + '\n')
 
 
 def qemu_checks(out):
-    run(['bash', ROOT / 'enxerto/build.sh'], env={**os.environ, 'BOARD': 'starlte', 'BOOT_ARGS_LINE_LENGTH': '1024'})
-    image = ROOT / 'enxerto/out/starlte/Image'
-    header = image.read_bytes()
-    assert header[56:60] == b'ARM\x64' and struct.unpack_from('<Q', header, 16)[0] == len(header)
+    image, header, symbols = build_loader(out / 'boot-loader', False)
     run(['clang', '--target=aarch64-none-elf', '-c', HERE / 'enxerto_probe.S', '-o', out / 'probe.o'])
     run(['ld.lld', '--image-base=0', '-Ttext=0', '--entry=_start', out / 'probe.o', '-o', out / 'probe.elf'])
     run(['llvm-objcopy', '-O', 'binary', out / 'probe.elf', out / 'probe.bin'])
@@ -217,6 +382,9 @@ def qemu_checks(out):
                 assert report[7] == 0x3c0, f'interrupts unmasked: {report[7]:#x}'
                 actual = (case / 'ram.bin').read_bytes()
                 assert actual == expected, f'{case}: loaded RAM differs from host reference'
+                check_entry_console(capture_console(monitor, case, header, symbols), 2 if el2 else 1)
+                errors = (case / 'qemu.log').read_text()
+                assert 'Invalid ' not in errors and 'Abort' not in errors, errors
                 result = dict(gic=gic, entry_el=2 if el2 else 1, payload=version, status='pass',
                               boot_args=args, image_size=len(header), handoff_el=report[2] >> 2,
                               sctlr=report[3], tcr=report[5], ttbr0=report[6])
@@ -228,6 +396,7 @@ def qemu_checks(out):
                 proc.wait()
                 monitor.unlink(missing_ok=True)
     (out / 'qemu-summary.json').write_text(json.dumps(results, indent=2) + '\n')
+    display_probe_checks(out, kernel)
 
 
 def main():

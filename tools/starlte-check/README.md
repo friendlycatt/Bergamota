@@ -80,7 +80,7 @@ limitations below, after generating all 34 exported Mach headers.
 | Command | Default output directory | Main evidence |
 | --- | --- | --- |
 | `check.py` | `research/starlte/check/` | `summary.json`, compiled ELF/Mach-O objects; per-case `serial.txt`, `regs.txt`, `fb.png`, `qemu.log`, `runner.log` |
-| `enxerto.py` | `research/starlte/enxerto-check/` | `host-summary.json`, optional `qemu-summary.json`; per-guest `command.json`, `report.bin`, loaded `ram.bin`, registers and framebuffer |
+| `enxerto.py` | `research/starlte/enxerto-check/` | `host-summary.json`, `compatible-summary.json`, optional `qemu-summary.json` / `display-probe-summary.json`; per-guest commands, reports, RAM, console, registers and framebuffer |
 | `headers.py` | `research/starlte/header-check/` | `configure.log`, component Makefiles/headers, `results.json` with source hashes/commands/errors, `*.compile.log`, `genassym.json`; `mig-commands.json` with `--cpp` |
 | `reset.py` | `research/starlte/reset-check/` | Consolidated `summary.json`; `layout.json`, `boot-layout.json`, `genassym-command.json`, `symbols.json`, `fixture.json`; per-case commands, reports, tables, registers, framebuffer and `result.json` |
 
@@ -92,7 +92,9 @@ interrupt results too. High-address reset cases use sparse guest RAM;
 the separate-L1 fixture asks QEMU for a 67 GiB guest address range.
 
 All generated artifacts are under ignored directories by default.
-`enxerto.py --qemu` also builds `enxerto/out/starlte/`.
+`enxerto.py --qemu` also builds `enxerto/out/starlte/`, ending with the
+display-probe configuration. Exact normal/probe Images and ELFs are retained
+under the check output's `boot-loader/` and `display-probe-loader/`.
 
 ## Coverage and service boundaries
 
@@ -136,12 +138,24 @@ command-line padding, ABI offsets, charger selection, malformed-initrd
 rejection before destination writes, parent-specific FDT cell counts
 (2/1 and 2/2), and 32/64-bit initrd properties.
 
+Twenty-four host cases exercise the root-compatible gate used before Samsung
+MMIO: multi-string exact matches, child-only identities, prefixes, different
+case, absent/empty lists, invalid block/property bounds and unterminated
+strings. This gate recognizes the supplied Samsung template's spelling.
+
 `--qemu` builds and executes the **actual Samsung Enxerto Image**, including
 its startup, platform diagnostics, UI, page-table setup and final assembly
 handoff. Four cases cover GICv2/v3 × EL1/EL2. A synthetic payload probe
 reports entry registers; the host verifies byte-exact kernel/ADT/boot_args
 RAM, EL1, masked interrupts and MMU/I-cache/D-cache off. These cases test
 loader entry/handoff, with interrupt delivery covered by `check.py`.
+
+Two further EL1/EL2 cases build `STARLTE_DISPLAY_PROBE=1` and check the held
+screen's RGB strip and console, preserved incoming EL, outgoing EL1, and an
+untouched dirty payload-destination page. Normal and probe cases capture
+the production console's RAM history and verify the non-Exynos skip path.
+They execute no Samsung display MMIO: QEMU does not model DECON/IDMA. The
+physical trigger/readback path and panel refresh require the device test.
 
 ### Real headers: `headers.py`
 
