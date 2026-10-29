@@ -6,6 +6,7 @@
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;
 	uint64_t sctlr_before, sctlr_after;
+	uint64_t dma_lo, dma_size; /* starlte: Image-owned UFS arena, otherwise 0 */
 	int n_l3;
 };
 

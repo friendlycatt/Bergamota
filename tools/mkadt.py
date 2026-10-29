@@ -92,7 +92,7 @@ BOARDS = {
         # QEMU's low RAM must end before the source-derived scanout at 0xcc000000.
         qemu_mem=(0x50000000, 0x60000000),
         gic_version=2, gic=(0x10101000, 0x1000, 0x10102000, 0x1000),
-        timebase=26000000, vtimer_intid=27, ufs=False),
+        timebase=26000000, vtimer_intid=27),
 }
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
@@ -353,9 +353,15 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
-        ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
-    ])
+        ('compatible', cstr('samsung,exynos9810-ufs' if board == 'starlte' else 'qcom,ufshc')),
+        ('reg', u64(0x11120000, 0x200) if board == 'starlte' else u64(UFS, UFS_SIZE)),
+    ] + ([
+        ('vendor-reg', u64(0x11121100, 0x200)),
+        # Enxerto fills these only in the copied ADT, using its own loaded
+        # Image's DMA arena. Zero placeholders cannot initialize the host.
+        ('dma-pool', u64(0, 0)),
+        ('loader-image', u64(0, 0)),
+    ] if board == 'starlte' else []))
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.

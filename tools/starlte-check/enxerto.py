@@ -30,7 +30,7 @@ def compile_host(out, board, length):
         flags += [f'-DBOOT_ARGS_LINE_LENGTH={length}']
     run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-fPIC', '-shared', *flags,
          '-I', ROOT / 'enxerto', HERE / 'enxerto_host.c',
-         *[ROOT / 'enxerto' / f'{name}.c' for name in ('loader', 'fdt', 'inflate')], '-o', lib])
+         *[ROOT / 'enxerto' / f'{name}.c' for name in ('loader', 'fdt', 'adt', 'inflate')], '-o', lib])
     dll = ctypes.CDLL(str(lib))
     dll.test_boot.argtypes = [ctypes.c_size_t]
     dll.test_boot.restype = ctypes.c_char_p
@@ -40,6 +40,14 @@ def compile_host(out, board, length):
     dll.fdt_root_compatible.argtypes = [ctypes.c_size_t, ctypes.c_char_p]
     dll.fdt_root_compatible.restype = ctypes.c_int
     return dll
+
+
+def fill_dma(tree, image_lo, image_hi, pool):
+    ufs = next(n for n in tree.children if n.name == 'sweet-ufs')
+    values = {'dma-pool': struct.pack('<QQ', pool, 0x104000),
+              'loader-image': struct.pack('<QQ', image_lo, image_hi - image_lo)}
+    ufs.props = [(k, f, values.get(k, v)) for k, f, v in ufs.props]
+    return adt.serialize(tree)
 
 
 def synthetic_kernel(out, entry=b''):
@@ -194,7 +202,11 @@ def host_checks(out):
                 assert struct.unpack_from('<QQ', args, length + 112) == (0, size)
                 adt_off, adt_size = struct.unpack_from('<QQ', blob, 0x20)
                 adt_va = struct.unpack_from('<Q', args, 96)[0]
-                assert ctypes.string_at(phys + adt_va - VIRT, adt_size) == blob[adt_off:adt_off + adt_size]
+                payload_tree, _ = adt.parse(blob[adt_off:adt_off + adt_size])
+                expected_adt = (fill_dma(payload_tree, 0x81000000, 0x81300000, 0x81100000)
+                                if board == 'starlte' else blob[adt_off:adt_off + adt_size])
+                assert ctypes.string_at(phys + adt_va - VIRT, adt_size) == expected_adt
+                assert ctypes.string_at(start, len(blob)) == blob, 'modified source payload'
                 assert ctypes.c_uint.in_dll(dll, 'charger_handoffs').value == (board != 'starlte')
                 diagnostics = (ctypes.c_char * 8192).in_dll(dll, 'diagnostics')
                 diagnostics.value = b''
@@ -206,6 +218,14 @@ def host_checks(out):
                 ctypes.memset(phys, 0xa5, size)
                 assert dll.test_boot(ctypes.addressof(fdt)) == b'bad segment table'
                 assert ctypes.string_at(phys, size) == b'\xa5' * size
+                # Destination/image overlap is rejected before segment copies.
+                struct.pack_into('<I', payload, 12, len(pieces))
+                ctypes.c_uint64.in_dll(dll, 'test_image_lo').value = phys
+                ctypes.c_uint64.in_dll(dll, 'test_image_hi').value = phys + size
+                assert dll.test_boot(ctypes.addressof(fdt)) == b'payload overlaps Enxerto image'
+                assert ctypes.string_at(phys, size) == b'\xa5' * size
+                ctypes.c_uint64.in_dll(dll, 'test_image_lo').value = 0x81000000
+                ctypes.c_uint64.in_dll(dll, 'test_image_hi').value = 0x81300000
                 results.append(dict(board=board, boot_args=length, payload=version, status='pass'))
                 print(f'PASS Enxerto host: {board}, boot_args={length}, payload v{version}, FDT/BSS/handoff')
             # Accept 32-bit /chosen properties as well as the 64-bit fixture form.
@@ -340,12 +360,29 @@ def qemu_checks(out):
         case = out / f'gic{gic}-el{2 if el2 else 1}-v{version}'
         case.mkdir(exist_ok=True)
         tree = build_tree(board='starlte', qemu=True, gic_version=gic)
+        dma_case = gic == 2 and el2
+        if dma_case:
+            # The synthetic payload only records a handoff; it never accesses
+            # these Samsung registers. Exercise the real loader's DMA export.
+            tree.children.append(next(n for n in build_tree(board='starlte').children if n.name == 'sweet-ufs'))
         adt_path = case / 'fixture.adt'
         adt_path.write_bytes(adt.serialize(tree))
         blob, _ = mkpayload.build(kernel, adt_path, 'debug=0xc', compress=version == 2)
         payload = case / 'payload.bin'
         payload.write_bytes(blob)
         phys, expected, args, _ = qemu.build_image(blob)
+        if dma_case:
+            image_lo = 0x40200000
+            image_hi = (image_lo + len(header) + PAGE - 1) & ~(PAGE - 1)
+            pool = (image_lo + symbols['ufs_dma_arena'] + PAGE - 1) & ~(PAGE - 1)
+            assert image_lo <= pool and pool + 0x104000 <= image_lo + len(header)
+            adt_off, adt_size = struct.unpack_from('<QQ', blob, 0x20)
+            payload_tree, _ = adt.parse(blob[adt_off:adt_off + adt_size])
+            filled = fill_dma(payload_tree, image_lo, image_hi, pool)
+            adt_at = struct.unpack_from('<Q', blob, 0x30)[0] - VIRT
+            expected = bytearray(expected)
+            expected[adt_at:adt_at + len(filled)] = filled
+            expected = bytes(expected)
         monitor = case / 'qmp.sock'
         monitor.unlink(missing_ok=True)
         serial = case / 'serial.txt'
@@ -387,7 +424,8 @@ def qemu_checks(out):
                 assert 'Invalid ' not in errors and 'Abort' not in errors, errors
                 result = dict(gic=gic, entry_el=2 if el2 else 1, payload=version, status='pass',
                               boot_args=args, image_size=len(header), handoff_el=report[2] >> 2,
-                              sctlr=report[3], tcr=report[5], ttbr0=report[6])
+                              sctlr=report[3], tcr=report[5], ttbr0=report[6],
+                              dma_handoff=(dict(base=pool, size=0x104000) if dma_case else None))
                 results.append(result)
                 print(f'PASS Enxerto QEMU: GICv{gic}, EL{2 if el2 else 1} entry, payload v{version}, exact RAM/boot_args, MMU off')
             finally:

@@ -13,6 +13,11 @@ static jmp_buf handoff;
 uint64_t captured_entry, captured_args;
 unsigned int charger_handoffs;
 char diagnostics[8192];
+/* Model the Image-owned arena at the MMU-service boundary. Host memory has
+ * process VAs, so these physical addresses are metadata only in host tests.
+ */
+uint64_t test_image_lo = 0x81000000, test_image_hi = 0x81300000;
+uint64_t test_dma_lo = 0x81100000, test_dma_size = 0x104000;
 
 const char *test_boot(uintptr_t fdt)
 {
@@ -27,6 +32,10 @@ int mmu_enable_ranges(struct mmu_info *info, const struct mmu_range *ranges, int
 	(void)ranges;
 	(void)n;
 	memset(info, 0, sizeof(*info));
+	info->img_lo = test_image_lo;
+	info->img_hi = test_image_hi;
+	info->dma_lo = test_dma_lo;
+	info->dma_size = test_dma_size;
 	return 0;
 }
 

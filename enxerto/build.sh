@@ -51,7 +51,7 @@ case ${BERGAMOTA:-} in
 esac
 SRCS="start.S enxerto.c console.c artdraw.c bootui.c fbui.c mmu.c fdt.c loader.c ufs.c inflate.c usb_dwc3.c usb_power.c fastboot.c sparse.c storage.c blake2b.c bergamota.c pmic.c charge.c charge_mode.c charger.c"
 if [ "$BOARD" = starlte ]; then
-	SRCS="start.S starlte.c console.c artdraw.c bootui.c mmu.c fdt.c loader.c inflate.c"
+	SRCS="start.S starlte.c console.c artdraw.c bootui.c mmu.c fdt.c adt.c loader.c inflate.c"
 fi
 OBJS=""
 COBJS=""

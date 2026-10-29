@@ -58,6 +58,14 @@ extern char _head[], _end[];
 #define MAX_L3		10
 static uint64_t pt_pool[(MAX_L3 + 2) * NENT] __attribute__((aligned(4096)));
 
+#if defined(BOARD_STARLTE)
+/* 1 MiB bounce + 16 KiB descriptors, with one page of runtime-alignment slack.
+ * NOLOAD in the ELF, included as zeros by build.sh's Image padding. Unlike an
+ * arbitrary low-RAM carve-out, these bytes are owned by the loaded Image.
+ */
+static uint8_t ufs_dma_arena[0x108000] __attribute__((aligned(4096), section(".ufs_dma")));
+#endif
+
 static void dcache_inval_range(uintptr_t start, uintptr_t end)
 {
 	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
@@ -98,6 +106,11 @@ int mmu_enable_ranges(struct mmu_info *info, const struct mmu_range *extra, int 
 	info->img_lo = img_lo;
 	info->img_hi = img_hi;
 	info->ttbr = pool;
+	info->dma_lo = info->dma_size = 0;
+#if defined(BOARD_STARLTE)
+	info->dma_lo = ((uintptr_t)ufs_dma_arena + PG_SIZE - 1) & ~(PG_SIZE - 1);
+	info->dma_size = 0x104000;
+#endif
 	if (n_extra > 3)
 		return -1;
 	wb[n++] = (struct mmu_range){ img_lo, img_hi };

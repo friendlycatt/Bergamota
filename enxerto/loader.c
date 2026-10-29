@@ -13,6 +13,7 @@
  * mmu_off_jump cleans it all to memory before xnu starts.
  */
 #include <stdint.h>
+#include "adt.h"
 #include "bootui.h"
 #include "charger.h"
 #include "console.h"
@@ -244,6 +245,9 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 	int mmu_rc = mmu_enable_ranges(&mi, wb, 2);
 	con_hex2("MMU", "rc=", (uint32_t)mmu_rc, "l3=", (uint32_t)mi.n_l3);
 	wb[2] = (struct mmu_range){ mi.img_lo, mi.img_hi };
+	if (mi.img_lo && ((rd_start < mi.img_hi && mi.img_lo < rd_end) ||
+	    (p->phys_base < mi.img_hi && mi.img_lo < p->phys_base + p->mem_size)))
+		return "payload overlaps Enxerto image";
 	bootui_progress(PM_MMU, "MMU ON");
 
 	infl_base = 0;
@@ -281,6 +285,16 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+#if defined(BOARD_STARLTE)
+	int dma_rc = adt_ufs_dma(adt_pa, p->adt_size, mi.img_lo, mi.img_hi,
+			       mi.dma_lo, mi.dma_size, p->phys_base, p->mem_size);
+	if (dma_rc < 0)
+		return "invalid UFS DMA handoff";
+	if (dma_rc) {
+		con_hex("UFS DMA", mi.dma_lo);
+		con_hex("DMA SIZE", mi.dma_size);
+	}
+#endif
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 	if (top != top_pa)

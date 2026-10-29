@@ -1,0 +1,1021 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1,13 +1,14 @@
+ /*
+  * SWEET internal UFS root device.
+  *
+- * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
++ * The UFS host (UFSHCI 2.1) is left enabled with the link up by the
+  * bootloader, which loaded our boot image from it. This driver reuses that
+  * state: it points the transfer request list at its own memory (verifying the
+  * host took it before ringing any doorbell) and issues polled SCSI commands,
+- * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
++ * one at a time. It finds one GPT partition by name (boot-arg
+  * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
+- * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
++ * (rufsroot0), with 512-byte logical sectors. Qualcomm retains its LUN 0 /
++ * 4 KiB defaults; starlte discovers capacity/block size on LUNs 0..7.
+  * Root on it with rd=ufsroot0.
+  *
+  * All DMA goes through one physically contiguous allocation (descriptors and
+@@ -27,6 +28,13 @@
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
++ *
++ * Exynos9810 bring-up is always read-only, including when ufsrw=1 is given.
++ * Its DMA32 arena is handed off inside Enxerto's loaded Image, outside XNU
++ * RAM, and mapped Normal non-cacheable. Samsung needs byte-based UTRD
++ * fields, 128-byte FMP-bypass PRDT entries, Nexus setup and positive-bit
++ * list clearing. A timed-out Exynos host is never retried or its DMA reused.
++ * ufsprobe=1 holds the final read-only probe result before any root mount.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -58,6 +66,7 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ /* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+ extern int get_preemption_level(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -87,12 +96,20 @@
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_UTMRLDBR    0x78
++#define REG_UTMRLRSR    0x80
++
++/* Vendor window at 0x11121100, separate from the standard HCI window. */
++#define EXYNOS_TXPRDT   0x00
++#define EXYNOS_RXPRDT   0x04
++#define EXYNOS_NEXUS    0x40
++#define EXYNOS_PRD_SIZE 128u
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
+-#define UFS_BLOCK       4096u
++#define UFS_BLOCK       (su.block_size)        /* immutable after root discovery */
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+@@ -103,16 +120,18 @@
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+ 	uint32_t ucdba, ucdbau;
+-	uint32_t resp;          /* [31:16] response UPIU offset, [15:0] length, DWORDs */
+-	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
++	uint32_t resp;          /* offset/length: DWORDs on Qualcomm, bytes on Exynos */
++	uint32_t prdt;          /* offset/length: DWORDs/entries, or bytes/bytes */
++};
++
++struct ufs_prd {
++	uint32_t addr_lo, addr_hi, rsvd, dbc;
+ };
+ 
+ struct ucd {
+ 	uint8_t cmd[512];
+ 	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
++	uint8_t prdt[PRDT_MAX * EXYNOS_PRD_SIZE];
+ };
+ 
+ /* Layout of the contiguous DMA allocation. */
+@@ -124,13 +143,23 @@
+ #define UFS_RETRIES     3u
+ #define UFS_SYNC_SECS   5u
+ 
++_Static_assert(sizeof(struct utrd) == 32, "UTRD size");
++_Static_assert(sizeof(struct ufs_prd) == 16, "base PRDT size");
++_Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "descriptor arena");
++
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t vendor;
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
++	uint64_t device_blocks;                 /* Exynos READ CAPACITY, current/root LUN */
++	uint32_t block_size;
++	bool exynos, dma_nc, host_owned, dead;
++	bool attempted;
++	int init_error;
+ 	uint8_t lun;
+ 	uint8_t tag;
+-	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
++	uint64_t first_block, nblocks;          /* partition, in device logical blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+@@ -145,7 +174,7 @@
+ 	uint32_t retries;                       /* ufsretries */
+ 	uint32_t syncsecs;                      /* ufssyncsecs */
+ 	bool dirty;                             /* writes completed since the last SYNCHRONIZE CACHE */
+-} su;
++} su = { .block_size = 4096 };
+ 
+ /*
+  * Counters, exported as sysctl kern.sweet_ufs.* (read-only). All but the strategy ones are updated
+@@ -189,6 +218,35 @@
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++static inline uint32_t
++exynos_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.vendor + off);
++}
++
++static inline void
++exynos_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.vendor + off) = v;
++}
++
++/* Samsung fmp.c: select DESCTYPE 3 (128-byte entries), embedded host 0.
++ * This changes the descriptor format, not disk keys or SMU access regions.
++ * All PRDT encryption selectors remain zero (raw, unencrypted transfers).
++ */
++static uint64_t
++exynos_fmp_format(void)
++{
++	register uint64_t x0 __asm__("x0") = 0xc2001810;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 3;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	    "x16", "x17", "cc", "memory");
++	return x0;
++}
++
+ /*
+  * flush_dcache64()/clean_dcache64() are a bare dsb under __ARM_COHERENT_IO__.
+  * The UFS root works with that today (the host evidently snoops), so the
+@@ -197,6 +255,10 @@
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
++	if (su.dma_nc) {
++		__builtin_arm_dsb(0xf);
++		return;
++	}
+ 	if (su.dmasync) {
+ 		sweet_dma_sync_va((const void *)(su.dma + off), len);
+ 	}
+@@ -206,6 +268,10 @@
+ static void
+ dma_clean(uint32_t off, uint32_t len)
+ {
++	if (su.dma_nc) {
++		__builtin_arm_dsb(0xf);
++		return;
++	}
+ 	if (su.dmasync) {
+ 		sweet_dma_sync_va((const void *)(su.dma + off), len);
+ 	}
+@@ -241,15 +307,32 @@
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + data_off;
+ 
+-	assert(len <= BOUNCE_SIZE);
+ 	*retry = false;
++	if (su.dead || !su.host_owned) {
++		return EIO;
++	}
++	if (!cdb_len || cdb_len > 16 || len > BOUNCE_SIZE || ((data_off | len) & 3u) ||
++	    data_off < DMA_BOUNCE ||
++	    data_off > su.dma_size || len > su.dma_size - data_off) {
++		return EINVAL;
++	}
++	/* Enforce read-only at the command boundary, not just the BSD device. */
++	if (su.exynos && (write || (cdb[0] != 0x00 && cdb[0] != 0x25 &&
++	    cdb[0] != 0x28 && cdb[0] != 0x88 &&
++	    !(cdb[0] == 0x9e && cdb_len == 16 && cdb[1] == 0x10)))) {
++		return EROFS;
++	}
++	if (ufs_rd(REG_UTRLDBR)) {
++		su.dead = true;
++		return EBUSY;
++	}
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+ 	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[3] = su.exynos ? 0 : ++su.tag; /* Samsung task tag is slot 0 */
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
+@@ -261,16 +344,22 @@
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	uint32_t unit = su.exynos ? 1 : 4;
++	uint32_t stride = su.exynos ? EXYNOS_PRD_SIZE : sizeof(struct ufs_prd);
++	uint32_t prdt_bytes = 0;
++	utrd->resp = (512u / unit) << 16 | (512u / unit);
++	utrd->prdt = (1024u / unit) << 16;
+ 	if (len) {
+ 		uint32_t n = 0;
+ 		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+ 			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
+-		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
++			struct ufs_prd *prd = (struct ufs_prd *)(ucd->prdt + n * stride);
++			prd->addr_lo = (uint32_t)(bounce_pa + done);
++			prd->addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			prd->dbc = chunk - 1; /* high FMP algorithm/key bits stay zero */
++		}
++		prdt_bytes = n * stride;
++		utrd->prdt |= su.exynos ? prdt_bytes : n;
+ 	}
+ 
+ 	if (su.cache) {
+@@ -278,8 +367,7 @@
+ 		dma_clean(DMA_UCD, 16 + cdb_len);
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+-			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			dma_clean(DMA_UCD + offsetof(struct ucd, prdt), prdt_bytes);
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -294,6 +382,14 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	if (su.exynos) {
++		exynos_wr(EXYNOS_NEXUS, exynos_rd(EXYNOS_NEXUS) | 1u);
++		__builtin_arm_dsb(0xf);
++		if (!(exynos_rd(EXYNOS_NEXUS) & 1u)) {
++			su.dead = true;
++			return EIO;
++		}
++	}
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -309,7 +405,7 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			ufs_wr(REG_UTRLCLR, su.exynos ? 1u : ~1u);
+ 			/*
+ 			 * The host retires the slot on its own, but the device may still own the data
+ 			 * window until it does: give it a bounded moment before the buffer is reused
+@@ -331,7 +427,11 @@
+ 			}
+ 			printf("SWEET UFS: command 0x%02x timed out (is 0x%x hcs 0x%x dbr 0x%x)\n",
+ 			    cdb[0], is, ss.last_hcs, ufs_rd(REG_UTRLDBR));
+-			*retry = true;
++			/* Never reuse Exynos DMA after a timeout, even if DBR clears.
++			 * The arena stays reserved for the remainder of this boot.
++			 */
++			su.dead = su.exynos || (ufs_rd(REG_UTRLDBR) & 1u);
++			*retry = !su.dead;
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -368,6 +468,20 @@
+ 			printf("SWEET UFS: command 0x%02x completed with error status is 0x%x hcs 0x%x\n",
+ 			    cdb[0], is, ss.last_hcs);
+ 		}
++		if (su.exynos) {
++			ss.cmd_failures++;
++			ss.last_cdb = cdb[0];
++			su.dead = true;
++			return EIO;
++		}
++	}
++	if (su.exynos && (ucd->resp[2] != su.lun || ucd->resp[3] != 0)) {
++		printf("STARLTE UFS: mismatched response LUN/tag %u/%u, expected %u/0\n",
++		    ucd->resp[2], ucd->resp[3], su.lun);
++		ss.cmd_failures++;
++		ss.last_cdb = cdb[0];
++		su.dead = true;
++		return EIO;
+ 	}
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		/* Sense data follows the 32 byte header: u16 length, then fixed-format sense. */
+@@ -399,17 +513,27 @@
+ 			uint32_t key = sense >> 16;
+ 			*retry = ucd->resp[7] == SCSI_BUSY || ucd->resp[7] == SCSI_TASK_SET_FULL ||
+ 			    (ucd->resp[7] == SCSI_CHECK_CONDITION && (key == 6 || key == 2 || key == 0xb));
+-		} else {
++		} else if (!su.exynos) {
+ 			*retry = (ocs == 5 || ocs == 7 || ocs == 6);
+ 		}
++		if (su.exynos && (ocs || ucd->resp[0] != 0x21 || ucd->resp[6])) {
++			su.dead = true;
++		}
+ 		return EIO;
+ 	}
+-	if (len && be32(&ucd->resp[12])) {
+-		/* Counted, not failed: nothing says the host reports this reliably on this part. */
++	if (len && (be32(&ucd->resp[12]) || (su.exynos && (ucd->resp[1] & 0x60)))) {
++		/* Qualcomm retains its historical residual policy; a probe must
++		 * never report a partial/overflowing Samsung transfer as a good read.
++		 */
+ 		ss.resid_nonzero++;
+ 		if (ufs_fail_logged++ < UFS_FAIL_LOG_MAX) {
+ 			printf("SWEET UFS: command 0x%02x residual %u of %u bytes\n", cdb[0],
+ 			    be32(&ucd->resp[12]), len);
++		}
++		if (su.exynos) {
++			ss.cmd_failures++;
++			ss.last_cdb = cdb[0];
++			return EIO;
+ 		}
+ 	}
+ 	return 0;
+@@ -442,19 +566,37 @@
+ 	return ufs_scsi_at(cdb, cdb_len, len, write, DMA_BOUNCE);
+ }
+ 
+-/* READ(10) of count device blocks at lba into the data window at data_off; fua reads the medium. */
++/* READ(10/16) into the data window; all arithmetic is in device blocks. */
+ static int
+ ufs_read_at(uint64_t lba, uint32_t count, uint32_t data_off, bool fua)
+ {
+-	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
++	if (!UFS_BLOCK || !count || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba > UINT64_MAX - (count - 1) ||
++	    (su.exynos && (lba >= su.device_blocks || count > su.device_blocks - lba))) {
+ 		return EINVAL;
+ 	}
+-	uint8_t cdb[10] = {
+-		0x28, (uint8_t)(fua ? 0x08 : 0),
+-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+-		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+-	};
+-	int error = ufs_scsi_at(cdb, sizeof(cdb), count * UFS_BLOCK, false, data_off);
++	uint8_t cdb[16] = { 0 };
++	unsigned cdb_len;
++	cdb[1] = fua ? 0x08 : 0;
++	if (lba + count - 1 <= UINT32_MAX) {
++		cdb_len = 10;
++		cdb[0] = 0x28;
++		for (unsigned i = 0; i < 4; i++) {
++			cdb[2 + i] = (uint8_t)(lba >> (24 - 8 * i));
++		}
++		cdb[7] = (uint8_t)(count >> 8);
++		cdb[8] = (uint8_t)count;
++	} else {
++		cdb_len = 16;
++		cdb[0] = 0x88;
++		for (unsigned i = 0; i < 8; i++) {
++			cdb[2 + i] = (uint8_t)(lba >> (56 - 8 * i));
++		}
++		for (unsigned i = 0; i < 4; i++) {
++			cdb[10 + i] = (uint8_t)(count >> (24 - 8 * i));
++		}
++	}
++	int error = ufs_scsi_at(cdb, cdb_len, count * UFS_BLOCK, false, data_off);
+ 	if (!error) {
+ 		ss.reads++;
+ 		ss.read_blocks += count;
+@@ -522,7 +664,8 @@
+ {
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++	    count > su.nblocks - (lba - su.first_block) ||
++	    lba > UINT32_MAX || count - 1 > UINT32_MAX - lba) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
+@@ -570,8 +713,67 @@
+ 	return error;
+ }
+ 
+-static int
+-ufs_find_partition(const char *want)
++static uint32_t
++ufs_crc32(const uint8_t *b, uint32_t len, bool header)
++{
++	uint32_t crc = UINT32_MAX;
++	for (uint32_t i = 0; i < len; i++) {
++		crc ^= (header && i >= 16 && i < 20) ? 0 : b[i];
++		for (unsigned bit = 0; bit < 8; bit++) {
++			crc = (crc >> 1) ^ ((0u - (crc & 1u)) & 0xedb88320u);
++		}
++	}
++	return ~crc;
++}
++
++static uint64_t
++ufs_le64(const uint8_t *b)
++{
++	uint64_t value;
++	memcpy(&value, b, sizeof(value));
++	return value;
++}
++
++static uint32_t
++ufs_le32(const uint8_t *b)
++{
++	uint32_t value;
++	memcpy(&value, b, sizeof(value));
++	return value;
++}
++
++/* Exact ASCII names in UTF-16LE. Samsung uses uppercase partition names;
++ * only case is ignored there. Non-ASCII suffixes must not become matches.
++ */
++static bool
++ufs_partition_name(const uint8_t *entry, const char *want)
++{
++	for (unsigned i = 0; i < 36; i++) {
++		unsigned ch = entry[56 + i * 2] | (unsigned)entry[57 + i * 2] << 8;
++		unsigned w = (unsigned char)want[i];
++		if (ch > 0x7f) {
++			return false;
++		}
++		if (su.exynos) {
++			if (ch >= 'A' && ch <= 'Z') { ch += 'a' - 'A'; }
++			if (w >= 'A' && w <= 'Z') { w += 'a' - 'A'; }
++		}
++		if (ch != w) {
++			return false;
++		}
++		if (!ch) {
++			return true;
++		}
++	}
++	return want[36] == 0;
++}
++
++/* Caller owns the command lock. Strict Exynos checks use measured capacity;
++ * Qualcomm keeps its existing geometry/name policy. Bounds arithmetic and
++ * the single parser are shared with read-only auxiliary partition lookup.
++ */
++static int
++ufs_gpt_find_on_lun(const char *want, uint64_t *first, uint64_t *nblocks)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -579,49 +781,144 @@
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+ 	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	uint64_t entry_lba = ufs_le64(b + 72);
++	uint64_t usable_first = ufs_le64(b + 40), usable_last = ufs_le64(b + 48);
++	uint32_t nent = ufs_le32(b + 80), esz = ufs_le32(b + 84);
++	uint32_t entries_crc = ufs_le32(b + 88);
++	if (esz < 128 || (esz & (esz - 1)) || !nent || nent > BOUNCE_SIZE / esz) {
++		printf("SWEET UFS: invalid GPT entries %u x %u\n", nent, esz);
++		return EINVAL;
++	}
++	uint32_t bytes = nent * esz;
++	uint32_t blocks = (bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (su.exynos) {
++		uint32_t hsize = ufs_le32(b + 12);
++		if (ufs_le32(b + 8) != 0x10000 || hsize < 92 || hsize > UFS_BLOCK ||
++		    ufs_le32(b + 20) || ufs_le64(b + 24) != 1 ||
++		    ufs_le64(b + 32) != su.device_blocks - 1 || usable_first < 2 ||
++		    usable_first > usable_last || usable_last >= su.device_blocks - 1 ||
++		    entry_lba < 2 || entry_lba > usable_first || blocks > usable_first - entry_lba) {
++			printf("STARLTE UFS: LUN %u invalid GPT geometry\n", su.lun);
++			return EINVAL;
++		}
++		if (ufs_crc32(b, hsize, true) != ufs_le32(b + 16)) {
++			printf("STARLTE UFS: LUN %u GPT header CRC mismatch\n", su.lun);
++			return EIO;
++		}
++	}
++	error = ufs_read_blocks(entry_lba, blocks);
+ 	if (error) {
+ 		return error;
+ 	}
++	if (su.exynos && ufs_crc32(b, bytes, false) != entries_crc) {
++		printf("STARLTE UFS: LUN %u GPT entry CRC mismatch\n", su.lun);
++		return EIO;
++	}
++	bool found = false;
+ 	for (uint32_t i = 0; i < nent; i++) {
+ 		const uint8_t *e = b + i * esz;
+-		char name[37];
+-		unsigned c;
+-		for (c = 0; c < 36; c++) {
+-			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
+-				break;
+-			}
+-			name[c] = (char)ch;
+-		}
+-		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
++		if (!(ufs_le64(e) | ufs_le64(e + 8)) || !ufs_partition_name(e, want)) {
+ 			continue;
+ 		}
+-		uint64_t first, last;
+-		memcpy(&first, e + 32, 8);
+-		memcpy(&last, e + 40, 8);
+-		if (last < first) {
+-			return ENXIO;
+-		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
+-		return 0;
+-	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+-	return ENOENT;
++		uint64_t f = ufs_le64(e + 32), l = ufs_le64(e + 40);
++		if (l < f || l - f == UINT64_MAX || l - f + 1 > UINT64_MAX / UFS_BLOCK ||
++		    (su.exynos && (f < usable_first || l > usable_last))) {
++			return EINVAL;
++		}
++		if (found) {
++			return EEXIST;
++		}
++		*first = f;
++		*nblocks = l - f + 1;
++		found = true;
++	}
++	if (su.exynos) {
++		printf("STARLTE UFS: LUN %u GPT CRCs OK, %u entries, %s %s\n",
++		    su.lun, nent, want, found ? "found" : "absent");
++	}
++	return found ? 0 : ENOENT;
++}
++
++static int
++ufs_read_capacity(void)
++{
++	static const uint8_t cap10[10] = { 0x25 };
++	static const uint8_t cap16[16] = { 0x9e, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32 };
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	su.device_blocks = 0;
++	int error = ufs_scsi(cap10, sizeof(cap10), 8, false);
++	if (error) { return error; }
++	uint64_t last = be32(b);
++	uint32_t size = be32(b + 4);
++	if (last == UINT32_MAX) {
++		error = ufs_scsi(cap16, sizeof(cap16), 32, false);
++		if (error) { return error; }
++		last = (uint64_t)be32(b) << 32 | be32(b + 4);
++		size = be32(b + 8);
++	}
++	if (size < DEV_BSIZE || size > 4096 || (size & (size - 1)) ||
++	    last < 2 || last == UINT64_MAX || last + 1 > UINT64_MAX / size) {
++		printf("STARLTE UFS: LUN %u unsupported capacity last 0x%llx block %u\n", su.lun, last, size);
++		return EINVAL;
++	}
++	su.block_size = size;
++	su.device_blocks = last + 1;
++	printf("STARLTE UFS: LUN %u capacity %llu MiB, %llu blocks x %u bytes\n",
++	    su.lun, su.device_blocks * size >> 20, su.device_blocks, size);
++	return 0;
++}
++
++static int
++ufs_find_partition(const char *want)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	if (!su.exynos) {
++		return ufs_gpt_find_on_lun(want, &su.first_block, &su.nblocks);
++	}
++	int last_error = ENOENT;
++	for (su.lun = 0; su.lun < 8 && !su.dead; su.lun++) {
++		int error = ufs_scsi(tur, sizeof(tur), 0, false);
++		if (!error) { error = ufs_read_capacity(); }
++		if (!error) { error = ufs_gpt_find_on_lun(want, &su.first_block, &su.nblocks); }
++		if (!error) {
++			return 0;
++		}
++		printf("STARLTE UFS: LUN %u scan result %d%s\n", su.lun, error,
++		    su.dead ? " (host stopped)" : "");
++		last_error = error;
++	}
++	return last_error;
++}
++
++/* Repeat a small real partition read, poisoning the bounce buffer between
++ * commands. Print only a checksum/filesystem hint, never device contents.
++ */
++static int
++ufs_readonly_probe(void)
++{
++	uint32_t blocks = 4096 / UFS_BLOCK;
++	if (su.nblocks < blocks) { return EINVAL; }
++	int error = ufs_read_blocks(su.first_block, blocks);
++	if (error) { return error; }
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t crc = ufs_crc32(b, 4096, false);
++	const char *fs = "unknown";
++	if (ufs_le32(b + 1024) == 0xf2f52010) { fs = "F2FS"; }
++	else if (b[1080] == 0x53 && b[1081] == 0xef) { fs = "ext4"; }
++	else if (b[1024] == 'H' && (b[1025] == '+' || b[1025] == 'X')) { fs = "HFS+"; }
++	else if (memcmp(b + 32, "NXSB", 4) == 0) { fs = "APFS"; }
++	memset(b, 0xa5, 4096);
++	error = ufs_read_blocks(su.first_block, blocks);
++	if (error) { return error; }
++	if (ufs_crc32(b, 4096, false) != crc) {
++		printf("STARLTE UFS: repeated partition read differs\n");
++		return EIO;
++	}
++	printf("STARLTE UFS: READ-ONLY PROBE PASS, LUN %u, block %u, sample CRC %08x twice, %s\n",
++	    su.lun, UFS_BLOCK, crc, fs);
++	return 0;
+ }
+ 
+ static int
+@@ -632,7 +929,7 @@
+ 		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		return ENXIO;
+ 	}
+-	if (ufs_rd(REG_UTRLDBR)) {
++	if (ufs_rd(REG_UTRLDBR) || (su.exynos && ufs_rd(REG_UTMRLDBR))) {
+ 		printf("SWEET UFS: requests outstanding from the bootloader\n");
+ 		return EBUSY;
+ 	}
+@@ -645,6 +942,31 @@
+ 	ufs_wr(REG_IE, 0);                      /* polled operation */
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+ 	ufs_wr(REG_UTRLRSR, 0);
++	if (su.exynos) {
++		ufs_wr(REG_UTMRLRSR, 0);
++		__builtin_arm_dsb(0xf);
++		unsigned wait;
++		for (wait = 0; wait < 1000; wait++) {
++			if (!((ufs_rd(REG_UTRLRSR) | ufs_rd(REG_UTMRLRSR)) & 1u)) { break; }
++			delay(1);
++		}
++		if (wait == 1000 || ufs_rd(REG_UTRLDBR) || ufs_rd(REG_UTMRLDBR)) {
++			printf("STARLTE UFS: request lists did not stop\n");
++			return EBUSY;
++		}
++		uint64_t result = exynos_fmp_format();
++		printf("STARLTE UFS: FMP DESCTYPE 3 result 0x%llx, TX/RX 0x%x/0x%x nexus 0x%x\n",
++		    result, exynos_rd(EXYNOS_TXPRDT), exynos_rd(EXYNOS_RXPRDT), exynos_rd(EXYNOS_NEXUS));
++		if (result) { return ENXIO; }
++		/* Samsung's 12 is log2(4096), not the PRDT descriptor stride. */
++		exynos_wr(EXYNOS_TXPRDT, (exynos_rd(EXYNOS_TXPRDT) & ~0x1fu) | 12u);
++		exynos_wr(EXYNOS_RXPRDT, (exynos_rd(EXYNOS_RXPRDT) & ~0x1fu) | 12u);
++		__builtin_arm_dsb(0xf);
++		if ((exynos_rd(EXYNOS_TXPRDT) & 0x1fu) != 12 ||
++		    (exynos_rd(EXYNOS_RXPRDT) & 0x1fu) != 12) {
++			return EIO;
++		}
++	}
+ 	uint64_t list = su.dma_pa + DMA_UTRL;
+ 	ufs_wr(REG_UTRLBA, (uint32_t)list);
+ 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+@@ -655,6 +977,7 @@
+ 		printf("SWEET UFS: host did not take our request list\n");
+ 		return EIO;
+ 	}
++	su.host_owned = true;
+ 	return 0;
+ }
+ 
+@@ -691,6 +1014,14 @@
+ 		ss.strat_writes++;
+ 	}
+ 	buf_setresid(bp, count);
++	if (!su.ready) {
++		error = ENXIO;
++		goto done;
++	}
++	if (buf_blkno(bp) < 0 || (uint64_t)buf_blkno(bp) > UINT64_MAX / su.secsize) {
++		error = EINVAL;
++		goto done;
++	}
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+ 		goto done;
+@@ -883,58 +1214,6 @@
+ } part_cache[PART_CACHE_N];
+ static unsigned part_cache_n;
+ 
+-/* Caller holds sweet_ufs_lock and has set su.lun. */
+-static int
+-ufs_gpt_find_on_lun(const char *want, uint64_t *first, uint64_t *nblocks)
+-{
+-	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
+-	if (error) {
+-		return error;
+-	}
+-	if (memcmp(b, "EFI PART", 8) != 0) {
+-		return ENXIO;
+-	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
+-	if (error) {
+-		return error;
+-	}
+-	for (uint32_t i = 0; i < nent; i++) {
+-		const uint8_t *e = b + i * esz;
+-		char name[37];
+-		unsigned c;
+-		for (c = 0; c < 36; c++) {
+-			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
+-				break;
+-			}
+-			name[c] = (char)ch;
+-		}
+-		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
+-			continue;
+-		}
+-		uint64_t f, l;
+-		memcpy(&f, e + 32, 8);
+-		memcpy(&l, e + 40, 8);
+-		if (l < f) {
+-			return ENXIO;
+-		}
+-		*first = f;
+-		*nblocks = l - f + 1;
+-		return 0;
+-	}
+-	return ENOENT;
+-}
+-
+ /* Caller holds sweet_ufs_lock. */
+ static int
+ ufs_part_locate(const char *want, uint8_t *lun, uint64_t *first, uint64_t *nblocks)
+@@ -979,6 +1258,10 @@
+ 	if (!su.ready) {
+ 		return ENXIO;
+ 	}
++	/* This auxiliary API still assumes Qualcomm LUN geometry. */
++	if (su.exynos) {
++		return ENOTSUP;
++	}
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	int error = ufs_part_locate(name, &l, &first, &nblocks);
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+@@ -1000,6 +1283,9 @@
+ 	uint8_t lun = 0, saved;
+ 	if (!su.ready) {
+ 		return ENXIO;
++	}
++	if (su.exynos) {
++		return ENOTSUP;
+ 	}
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	int error = ufs_part_locate(name, &lun, &first, &nblocks);
+@@ -1024,22 +1310,96 @@
+ 	return error;
+ }
+ 
++static bool
++ufs_dt_read(DTEntry node, const char *name, void *out, unsigned expected)
++{
++	const void *value = NULL;
++	unsigned size = 0;
++	if (SecureDTGetProperty(node, name, &value, &size) != kSuccess || size != expected) {
++		return false;
++	}
++	memcpy(out, value, size);
++	return true;
++}
++
++static int
++exynos_dma_handoff(DTEntry node)
++{
++	uint64_t pool[2], image[2], ram, ram_size;
++	DTEntry chosen;
++	if (!ufs_dt_read(node, "dma-pool", pool, sizeof(pool)) ||
++	    !ufs_dt_read(node, "loader-image", image, sizeof(image)) ||
++	    SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    !ufs_dt_read(chosen, "dram-base", &ram, sizeof(ram)) ||
++	    !ufs_dt_read(chosen, "dram-size", &ram_size, sizeof(ram_size)) ||
++	    !image[0] || !image[1] || image[0] >= (1ull << 32) || image[1] > (1ull << 32) - image[0] ||
++	    (pool[0] & PAGE_MASK) || pool[1] != DMA_SIZE || pool[0] < image[0] ||
++	    pool[0] >= image[0] + image[1] || pool[1] > image[0] + image[1] - pool[0] ||
++	    !ram_size || ram_size > UINT64_MAX - ram ||
++	    (image[0] < ram + ram_size && ram < image[0] + image[1])) {
++		printf("STARLTE UFS: invalid/missing Image-owned DMA32 handoff; use the new Enxerto\n");
++		return ENXIO;
++	}
++	su.dma_pa = pool[0];
++	su.dma_nc = true;
++	su.dma = ml_io_map_wcomb(pool[0], pool[1]);
++	if (!su.dma) { return ENOMEM; }
++	bzero((void *)su.dma, su.dma_size);
++	printf("STARLTE UFS: DMA32 0x%llx+0x%llx inside Image 0x%llx+0x%llx, Normal-NC\n",
++	    pool[0], pool[1], image[0], image[1]);
++	return 0;
++}
++
++static void
++ufs_probe_hold(int error)
++{
++	uint32_t probe = 0;
++	PE_parse_boot_argn("ufsprobe", &probe, sizeof(probe));
++	if (!su.exynos || probe != 1) { return; }
++	printf("STARLTE UFS: probe %s (%d), writes %llu, commands failed %llu\n",
++	    error ? "FAILED" : "PASSED", error, ss.writes, ss.cmd_failures);
++	printf("STARLTE UFS: PROBE HOLD - photograph this screen, then reboot to recovery\n");
++	for (;;) {
++		assert_wait((event_t)&su, THREAD_UNINT);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+ 	DTEntry node;
+-	uintptr_t const *reg = NULL;
++	const void *reg_value = NULL;
++	uint64_t reg[2];
+ 	unsigned int size = 0;
+ 	char want[64] = "userdata";
+ 	int error;
++	su.exynos = sweet_board_is("samsung,starlte");
++	if (!su.exynos && !sweet_board_qualcomm()) { return ENXIO; }
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
++	    SecureDTGetProperty(node, "reg", &reg_value, &size) != kSuccess ||
++	    size < sizeof(reg)) {
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
++	memcpy(reg, reg_value, sizeof(reg)); /* ADT values are only four-byte aligned. */
++	if (su.exynos) {
++		char compat[sizeof("samsung,exynos9810-ufs")];
++		uint64_t vendor[2];
++		if (!ufs_dt_read(node, "compatible", compat, sizeof(compat)) ||
++		    memcmp(compat, "samsung,exynos9810-ufs", sizeof(compat)) ||
++		    size != 16 || reg[0] != 0x11120000 || reg[1] != 0x200 ||
++		    !ufs_dt_read(node, "vendor-reg", vendor, sizeof(vendor)) ||
++		    vendor[0] != 0x11121100 || vendor[1] != 0x200) {
++			printf("STARLTE UFS: invalid Exynos host description\n");
++			return ENXIO;
++		}
++		/* DMA validation happens below before any host register is accessed. */
++	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	want[sizeof(want) - 1] = 0;
++	if (!want[0] || strlen(want) > 36) { return EINVAL; }
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	uint32_t cache = 0, wait = 0;
+@@ -1077,41 +1437,55 @@
+ 	if (su.syncsecs > 3600) {
+ 		su.syncsecs = UFS_SYNC_SECS;
+ 	}
++	if (su.exynos) {
++		su.verify = su.fua = su.syncsecs = 0;
++		su.cache = su.wait = su.dmasync = false;
++		printf("STARLTE UFS: read-only bring-up (ufsrw ignored), scanning LUNs 0..7\n");
++	}
+ 	su.dma_size = DMA_SIZE + (su.verify ? BOUNCE_SIZE : 0);
+ 	printf("SWEET UFS: durability: verify %u, fua %u, retries %u, syncer %u s, dmasync %d\n",
+ 	    su.verify, su.fua, su.retries, su.syncsecs, su.dmasync);
++	if (su.exynos) {
++		error = exynos_dma_handoff(node);
++		if (error) { return error; }
++		su.vendor = ml_io_map(0x11121100, 0x200);
++		if (!su.vendor) { return ENOMEM; }
++	}
+ 
+ 	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	if (!su.regs) { return ENOMEM; }
+ 	printf("SWEET UFS: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x is 0x%x utrlba 0x%x:%x dbr 0x%x rsr 0x%x\n",
+ 	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_CAP), ufs_rd(0x08), ufs_rd(REG_IS),
+ 	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR));
+-	kern_return_t kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+-	if (kr != KERN_SUCCESS && su.verify) {
+-		/* no room for the read-back window: run without it */
+-		printf("SWEET UFS: no contiguous memory for ufsverify, verify off\n");
+-		su.verify = 0;
+-		su.dma_size = DMA_SIZE;
+-		kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
++	if (!su.exynos) {
++		kern_return_t kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
+ 		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+-	}
+-	if (kr != KERN_SUCCESS) {
+-		printf("SWEET UFS: no contiguous DMA memory\n");
+-		return ENOMEM;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+-	if (!pn) {
+-		return ENOMEM;
+-	}
+-	su.dma_pa = ptoa_64(pn);
++		if (kr != KERN_SUCCESS && su.verify) {
++			/* no room for the read-back window: run without it */
++			printf("SWEET UFS: no contiguous memory for ufsverify, verify off\n");
++			su.verify = 0;
++			su.dma_size = DMA_SIZE;
++			kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
++			    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		}
++		if (kr != KERN_SUCCESS) {
++			printf("SWEET UFS: no contiguous DMA memory\n");
++			return ENOMEM;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++		if (!pn) {
++			return ENOMEM;
++		}
++		su.dma_pa = ptoa_64(pn);
++	}
+ 	printf("SWEET UFS: DMA 0x%llx (+0x%x)\n", su.dma_pa, (unsigned)su.dma_size);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+-	if (!error) {
++	if (!error && !su.exynos) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		printf("SWEET UFS: host taken over, TEST UNIT READY\n");
+@@ -1122,7 +1496,11 @@
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++	if (!error && su.exynos) {
++		error = ufs_readonly_probe();
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
++	ufs_probe_hold(error); /* Before BSD registration or a root mount. */
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -1139,11 +1517,14 @@
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+-	su.writable = (rw != 0);
++	su.writable = !su.exynos && (rw != 0);
+ 	su.ready = true;
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	if (su.exynos) {
++		return 0;
++	}
+ 	sweet_log_start();
+ 	sweet_ufs_syncer_start();
+ 	sweet_ufs_selftest_start();
+@@ -1649,12 +2030,18 @@
+ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
+-	if (!su.ready) {
+-		int error = sweet_ufs_init();
+-		if (error) {
+-			return error;
+-		}
+-	}
++	/* A failed takeover may leave DMA outstanding. Never allocate/reuse an
++	 * arena or reprogram the host on the next root-mount attempt.
++	 */
++	if (!su.attempted) {
++		su.attempted = true;
++		su.init_error = sweet_ufs_init();
++		if (su.init_error) {
++			ufs_probe_hold(su.init_error); /* Include early ADT/DMA/mapping failures. */
++		}
++	}
++	if (su.init_error) { return su.init_error; }
++	if (su.dead) { return EIO; }
+ 	*dev = su.bdev;
+ 	return 0;
+ }

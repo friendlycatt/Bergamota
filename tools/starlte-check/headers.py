@@ -95,6 +95,8 @@ def flags(xnu, out, component):
     result += ['-I' + str(xnu), '-I' + str(out / 'exports')]
     if component == 'osfmk':
         result += ['-DMACH_KERNEL_PRIVATE', '-DMACH_KERNEL']
+    elif component == 'bsd':
+        result += ['-DBSD_KERNEL_PRIVATE']
     elif component == 'iokit':
         result += ['-DDRIVER_PRIVATE', '-DIOKIT_KERNEL_PRIVATE', '-DDRIVERKIT_PRIVATE=1',
                    '-DIOMATCHDEBUG=1', '-DIOALLOCDEBUG=1', '-DPRIVATE_WIFI_ONLY=1', '-DIOASSERT=1']

@@ -8,15 +8,18 @@ different board descriptions.
 [XNU-enabled refresh image](#xnu-enabled-refresh-image) now displays
 `Failed to write boot-picker-bringup-reason to NVRAM`. This matches XNU's
 [missing-boot-media path](#reported-xnu-root-device-wait), supporting physical
-XNU/BSD root-discovery progress. A full photograph/log is still needed;
-Samsung UFS access and an iOS root mount are not established. The physical
+XNU/BSD root-discovery progress. The [read-only UFS path](#read-only-samsung-ufs)
+now passes local transport, DMA-handoff and compilation checks; its new
+kernel build and device probe are next. Samsung storage access and an iOS
+root mount are not established. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
-fallback in patch 1019. The new kernel work is
-[`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch),
+fallback in patch 1019. The platform and storage work is in
+[`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch)
+and [`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -90,10 +93,11 @@ Hardware observations and remaining gaps:
   `boot_args.Video`, including its final kernel-VA alias. The complete
   scanout must fit one 32 MiB block. EL2 secondary entry checks whether the
   optional GIC system-register interface exists before accessing it.
-* The starlte ADT omits `/sweet-ufs`; the existing UFS-dependent peripheral
-  startup returns before MMIO. SPMI initialization is explicitly gated on
-  Qualcomm board identities. Framebuffer acceleration/backlight paths
-  already require beryllium.
+* The hardware starlte ADT supplies Samsung UFS registers and zero DMA/Image
+  placeholders. Enxerto fills them from its loaded Image; XNU validates the
+  handoff before touching the host and performs read-only LUN/GPT discovery.
+  UFS-dependent Qualcomm peripheral startup is gated explicitly, as is SPMI
+  initialization. Framebuffer acceleration/backlight paths require beryllium.
 * Enxerto selects `starlte.c` plus common framebuffer/FDT/MMU/loader code.
   FDT diagnostics honor each parent's address/size cells. Initrd payloads
   are validated before segment writes, and exact-byte copy/BSS clearing
@@ -104,6 +108,9 @@ Hardware observations and remaining gaps:
   Readbacks include trigger state, DECON control/frame/TE counters, programmed
   and shadow window/channel maps, and six IDMA base/source/config/offset sets.
   `STARLTE_DISPLAY_PROBE=1` holds the early screen before payload loading.
+* The padded starlte Image reserves a DMA32 arena after its stacks. Payload
+  and destination/Image overlap is rejected before segment copies. The bounded
+  ADT editor changes only the copied tree; XNU maps the pool Normal non-cacheable.
 
 ### QEMU description
 
@@ -113,6 +120,7 @@ PSCI HVC and contiguous physical MPIDRs. Default kernel RAM is
 `0x50000000 + 0x60000000`, disjoint from the framebuffer at `0xcc000000`.
 `--gic-version 2|3` and `--qemu-cpus 1..8` configure this description.
 The runner checks that its ADT agrees with QEMU's MMIO and CPU layout.
+QEMU ADTs omit UFS by default; QEMU `virt` does not model the Samsung host.
 
 ## Build artifacts and Samsung handoff
 
@@ -197,7 +205,8 @@ component guests work with this reduced ADT.
 
 Outputs are `enxerto/out/starlte/{Image,enxerto.elf}`. An optional absolute
 payload path passed to `build.sh` is copied to `out/starlte/payload.bin`.
-The raw ARM64 Image is position-independent and includes its BSS/stacks.
+The raw ARM64 Image is position-independent and includes its BSS/stacks and
+starlte DMA arena (currently **1740800 bytes** in the normal logging build).
 [`tools/mkboot-starlte.py`](../tools/mkboot-starlte.py) wraps it and a
 SWEETXNU payload using the legacy Samsung layout described below. The
 physical probe established loader entry and live placement; the later user
@@ -295,15 +304,16 @@ translation support.
 | Interrupt guest (`check.py`) | PASS, GICv2/v3 × 1/8 CPUs; 32 timer IRQs per CPU, 4/200 SGIs per case; ELF/Mach-O compilation and host payload checks |
 | Enxerto host (`enxerto.py`) | PASS, 12 cases: three boards × 608/1024-byte ABI × payload v1/v2; real producer, loader, FDT parser and inflater |
 | FDT hardware gate (`enxerto.py`) | PASS, 24 exact root-list/malformed input cases; child identities do not select MMIO |
-| Enxerto Image (`enxerto.py --qemu`) | PASS, four cases: GICv2/v3 × EL1/EL2; byte-exact synthetic kernel/ADT/boot_args and outgoing MMU/cache state |
+| Enxerto Image (`enxerto.py --qemu`) | PASS, four cases: GICv2/v3 × EL1/EL2; byte-exact synthetic kernel/ADT/boot_args and outgoing MMU/cache state, including Image-owned DMA export |
 | Display probe Image (`enxerto.py --qemu`) | PASS, EL1/EL2; held RGB strip/console, incoming EL preserved, dirty destination untouched; Samsung MMIO skipped |
 | XNU reset (`reset.py`) | PASS, 12 cases: five cold resets, four eight-CPU warm resets, three final-framebuffer aliases; no unexpected exceptions |
 | Real headers (`headers.py`) | Five successful complete translation-unit compiles, including production `genassym.c`, `arm_vm_init.c`, `pe_fiq.c`, `sweet_early.c`, `KernelConfigTables.cpp` |
 | Extended C++ (`headers.py --cpp`) | Exits 1: 34 real MIG headers generated, then `SweetCPU.cpp` needs IIG-generated `DriverKit/OSObject.h`; `SweetPlatformExpert.cpp` encounters Apple-only `__builtin_xnu_type_*` in IOLib |
-| Starlte Enxerto build | PASS, 655360-byte Image; header size/magic verified, no ABS64 relocations in C objects |
+| Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| Ordered patch reconstruction | PASS: four staging scripts, 274 applied patches, two documented dxb skips; all 6369 source files and 14 pre-1131 baseline hashes match |
+| UFS (`ufs.py`) | PASS, 93 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
+| Ordered patch reconstruction | PASS: four staging scripts, 275 applied patches, two documented dxb skips; all 6369 source files, 14 pre-1131 hashes and the pre-1132 UFS baseline match |
 | Full XNU26 CI build | PASS, run 40826795487; actual ARM64 Mach-O and patch 1131 markers verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43761664 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
@@ -312,9 +322,12 @@ translation support.
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
 `cac36bd98fc5ed6c1c6cab7de24bddc069fc62cf16f705d073a9920374c890bf`.
+Patch 1132 is 34532 bytes for `bsd/dev/sweet_ufs.c`, SHA256
+`6ee211f1f329c2f572dde7cc614780227da45b11e21bdaf9dfed9299164587a6`.
 The reconstruction uses XNU `xnu-12377.121.6` at
 `ac9718fb1af618d5ce8678d0dc6e8a58f252216f` and dxb at
-`663906528d1cd5ea8fde7de6f16de73db9511549`.
+`663906528d1cd5ea8fde7de6f16de73db9511549`. The latest complete reconstruction
+is retained in ignored `research/starlte/series-check-ufs/`.
 The freestanding guests establish component behavior. The full-kernel
 observations below extend this to QEMU startup execution. The physical
 probe establishes Enxerto entry and visible panel refresh. The later user
@@ -484,7 +497,7 @@ a root device.
 
 An inspection of the delivered refresh image confirms that its payload has
 no RAMDisk, `rd=` / `rootdev=` argument, `/chosen/root-matching` or boot UUID.
-Its starlte ADT omits `/sweet-ufs` (`tools/mkadt.py`: `ufs=False`). The current
+Its older starlte ADT omits `/sweet-ufs`. That image's
 `bsd/dev/sweet_ufs.c:1036–1040` returns `ENXIO` without that node. Thus flashing
 an iOS filesystem to userdata alone cannot make this kernel read it.
 
@@ -492,19 +505,71 @@ an iOS filesystem to userdata alone cannot make this kernel read it.
 
 The [pinned Samsung driver][samsung-ufs] and DTS identify:
 
-| Item | Reference finding | Consequence for the current XNU driver |
+| Item | Reference finding | Implemented handling |
 | --- | --- | --- |
-| Registers | HCI `0x11120000`, vendor HCI `0x11121100` | Board-specific mapping and inherited host/link-state validation |
-| Descriptor units | `UFSHCD_QUIRK_PRDT_BYTE_GRAN`, `ufs-exynos.c:559`; [ufshcd.c][samsung-ufshcd]:1695,3235 | Samsung uses byte offsets/lengths; XNU currently uses DWORD offsets and a PRDT entry count at `sweet_ufs.c:264–273` |
-| PRDT layout | `PRDT_SET_SIZE(12)` at `ufs-exynos.c:442–444` | Validate the vendor entry layout/stride and crypto fields before constructing requests |
-| DMA addressing | `DMA_BIT_MASK(32)` at `ufs-exynos.c:1216,1273` | XNU currently allocates descriptors/bounce memory from the entirely-above-4-GiB bank `0x880000000 + 0x80000000` |
+| Registers | HCI `0x11120000 + 0x200`, vendor HCI `0x11121100 + 0x200` | Exact ADT validation, mapped separately; inspect inherited HCE/HCS/request lists |
+| Descriptor units | `UFSHCD_QUIRK_PRDT_BYTE_GRAN`, `ufs-exynos.c:559`; [ufshcd.c][samsung-ufshcd]:1695,3235 | Byte-based response/PRDT offsets and lengths |
+| PRDT layout | `CONFIG_EXYNOS_FMP=y`; [ufshci.h][samsung-ufshci] and [fmp.c][samsung-fmp] | 128-byte entries, zero encryption selectors, DESCTYPE 3 via `SMC_CMD_FMP_SECURITY(0, 0, 3)` |
+| PRDT data unit | `PRDT_SET_SIZE(12)` at `ufs-exynos.c:442–444` | TX/RX low five bits set to 12: log2(4096), **not** a 12-byte descriptor stride |
+| Request quirks | Positive-bit `UTRLCLR`; vendor Nexus register offset `0x40` | Clear slot 0 with `1`; set and verify its Nexus bit before every command |
+| DMA addressing | Initial `DMA_BIT_MASK(32)`; `ufshcd_set_dma_mask()` can select 64-bit addressing when CAP.64AS permits | Use an Image-owned DMA32 arena even though XNU manages upper RAM |
 
-The 32-bit DMA mask is a **source-derived restriction**, not a measured
-hardware capability. Read the inherited controller state and resolve a
-verified DMA-addressable buffer arrangement before submitting requests;
-changing only the ADT register address is insufficient. The first storage
-milestone is read-only LUN/GPT discovery and bounded reads of the existing
-`userdata` partition.
+Actual DMA64 capability, link/clocks and secure-firmware acceptance are still
+unmeasured. The implementation reuses inherited host/link configuration; it
+does not initialize the Exynos PHY or recover a failed link.
+
+### Read-only Samsung UFS
+
+Patch 1132 extends `bsd/dev/sweet_ufs.c` with an Exynos-specific transport
+selected by the `samsung,starlte` board identity:
+
+1. **Owned DMA handoff.** Enxerto's `.ufs_dma` section reserves `0x108000`
+   bytes after the stacks, within the padded Image. Runtime 16 KiB alignment
+   yields a `0x104000`-byte pool: 16 KiB of descriptors and a 1 MiB bounce
+   buffer. `enxerto/adt.c` fills `/sweet-ufs/dma-pool` and `loader-image` in
+   the copied ADT. Both loader and kernel validate size, alignment, containment,
+   DMA32 bounds and separation from XNU's managed RAM. The kernel uses
+   `ml_io_map_wcomb()` (Normal non-cacheable) and explicit DMA barriers.
+2. **Conservative host takeover.** Require an enabled/ready host, idle transfer
+   and task lists, and stopped lists before the FMP format SMC
+   (`x0=0xc2001810`, `x1=x2=0`, `x3=3`). Check PRDT register setup and the new
+   list-base readback before issuing commands. An Exynos timeout permanently
+   quarantines the arena, even when request-clear succeeds; cached initialization
+   failures prevent a later root lookup from reusing it.
+3. **Read-only discovery.** Scan normal LUNs 0–7 with TEST UNIT READY and
+   READ CAPACITY(10/16), accepting 512–4096-byte power-of-two blocks. READ(10/16)
+   uses bounded transfers. Primary GPT geometry, header/entry CRCs, partition
+   bounds and case-insensitive ASCII names are checked. Read the first 4 KiB
+   of `userdata` twice, poisoning the bounce buffer between reads; print a CRC
+   and filesystem hint, without dumping partition contents.
+4. **Read-only enforcement.** Exynos ignores `ufsrw=1`; the command boundary
+   permits only the discovery/read opcodes. Write, flush, persistent-log and
+   auxiliary Qualcomm-partition paths cannot issue Samsung writes. Qualcomm
+   retains its existing writable-root features and descriptor format.
+
+Probe payload arguments:
+
+```text
+-v sweetearlyfb=1 debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam rd=ufsroot0 ufsprobe=1
+```
+
+Build the loader with `STARLTE_DISPLAY_PROBE=0`. Here **`ufsprobe=1` is a
+kernel storage probe**, not the earlier loader-only display probe: it prints
+`STARLTE UFS: probe PASSED` or `FAILED`, write/failure counters and
+`PROBE HOLD`, then waits before BSD disk registration or root mounting.
+Early ADT/DMA/mapping failures also reach the hold. Photograph the whole
+screen, including the controller/capacity/GPT lines. If execution stalls
+earlier, the last visible line identifies the next investigation point.
+
+**Local results:** `ufs.py --out research/starlte/ufs-check-final` exits 0:
+**93 byte-level host scenarios**, **24 ADT ownership/bounds cases**, and
+complete `sweet_ufs.c` real-header Mach-O compilation pass, with fatal
+ASan/UBSan checking. `enxerto.py --qemu` also passes 12 host payload cases,
+24 FDT cases, four normal handoffs (one verifies real DMA export), and two
+display-probe holds. Shared sweet/beryllium builds pass their kernel/DTB
+roundtrips and 511 host fastboot checks each. Exact service boundaries are
+documented in [`tools/starlte-check/README.md`](../tools/starlte-check/README.md).
+No Samsung storage hardware result or iOS root mount is established yet.
 
 ## Getting-started guide review for S9
 
@@ -514,7 +579,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patch 1131, fork `friendlycatt/Bergamota`; successful run **40826795487** already supplies the kernel. Future dispatches need `macos_version=26.5`. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131/1132, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates the UFS patch. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
@@ -569,10 +634,10 @@ this review creates no new boot image or hardware boot result.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Resolve UFS descriptor/DMA requirements,
-   validate the inherited host state, then read LUN capacity/GPT and bounded
-   userdata blocks. Prepare and verify the iOS26 root after host prerequisites
-   are available; a userdata write needs explicit confirmation.
+1. **Read-only Samsung storage.** Build and deliver the validated UFS source,
+   then obtain a photographed probe result for inherited host state, LUN
+   capacity/GPT and repeated userdata reads. Prepare and verify the iOS26 root
+   after actual reads; a userdata write needs explicit confirmation.
 2. **Complete the physical XNU record.** Obtain a photograph of the full
    last-visible screen surrounding the reported missing-media/NVRAM message.
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
@@ -592,6 +657,8 @@ this review creates no new boot image or hardware boot result.
 [samsung]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/arch/arm64/boot/dts/exynos/exynos9810-starlte_eur_open_26.dts
 [samsung-ufs]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufs-exynos.c
 [samsung-ufshcd]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufshcd.c
+[samsung-ufshci]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufshci.h
+[samsung-fmp]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/crypto/fmp/fmp.c
 [mu]: https://github.com/Project-Silicium/Mu-Silicium/tree/7a2ada19841a129f86fb791c0b9a710436c849a4
 [mu-dts]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Resources/DTBs/starlte.dts
 [mu-memory]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Platforms/Samsung/starltePkg/Library/MemoryMapLib/MemoryMapLib.c

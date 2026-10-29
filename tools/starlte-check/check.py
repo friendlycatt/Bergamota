@@ -82,7 +82,9 @@ def host_checks(image, memory_size):
     cpus = qemu.tree_node(hardware, '/cpus').children
     assert [struct.unpack('<I', c.prop('reg'))[0] for c in cpus] == [0, 1, 2, 3, 0x100, 0x101, 0x102, 0x103]
     assert qemu.tree_node(hardware, '/psci').prop('method') == b'smc\0'
-    assert not any(c.name == 'sweet-ufs' for c in hardware.children)
+    ufs = qemu.tree_node(hardware, '/sweet-ufs')
+    assert ufs.prop('compatible') == b'samsung,exynos9810-ufs\0'
+    assert ufs.prop('dma-pool') == bytes(16) and ufs.prop('loader-image') == bytes(16)
     hp = make_payload(hardware, image, memory_size, 2)
     try:
         qemu.qemu_config(hp)
