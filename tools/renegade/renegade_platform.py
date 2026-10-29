@@ -208,6 +208,10 @@ class MacOS(Backend):
         if not ex:
             r = self.run(self.DITTO + [src, dst], check=False)
             return r.returncode, r.stderr
+        if self.dry:
+            # The source volumes are only planned mounts; do not enumerate or copy them.
+            self.run(['copytree', src, dst] + [f'--exclude={e}' for e in ex])
+            return 0, ''
         err, rc = '', 0
         os.makedirs(dst, exist_ok=True)
         shutil.copymode(src, dst)
@@ -252,6 +256,9 @@ class MacOS(Backend):
         RENEGADE_SIGNER=ldid signs with the pinned ldid instead (tests: compare it with codesign on this Mac)."""
         if os.environ.get('RENEGADE_SIGNER') == 'ldid':
             return Linux.adhoc_sign(self, path, ident, flags, entitlements, retries)
+        if self.dry:
+            self.run(self.sign_cmd(path, ident, flags, 'ENTITLEMENTS.plist' if entitlements else None))
+            return
         tmpdir = tempfile.mkdtemp(prefix='renegade-ents-')      # outside any bundle: codesign would seal it as a resource
         ents_file = None
         try:
@@ -503,6 +510,10 @@ class Linux(Backend):
         return jailbreak.host_ldid(download=not self.dry)
 
     def adhoc_sign(self, path, ident=None, flags=None, entitlements=None, retries=3):
+        if self.dry:
+            self.run(Linux.ldid_cmd(Linux.ldid(self), path, ident, flags,
+                                    'ENTITLEMENTS.plist' if entitlements else None))
+            return
         tmpdir = tempfile.mkdtemp(prefix='renegade-ents-')
         ents_file = None
         try:

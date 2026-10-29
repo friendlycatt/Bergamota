@@ -5,7 +5,9 @@
 What runs where: the command-construction and dry-run tests run anywhere (the Linux backend is driven with
 Runner(dry=True): nothing is executed). TestSignerParity needs macOS with codesign and the pinned ldid in research/jb/.
 """
+import contextlib
 import importlib.util
+import io
 import os
 import plistlib
 import shutil
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RENEGADE = os.path.abspath(os.path.join(HERE, '..'))
@@ -112,6 +115,49 @@ class TestLinuxCommands(unittest.TestCase):
         if os.geteuid() != 0:
             with self.assertRaises(SystemExit):
                 rp.Linux(rp.Runner(dry=False)).need_privileges()
+
+
+class TestRootDryRun(unittest.TestCase):
+    def test_before_downloads_without_creating_files_or_running_commands(self):
+        root = load('mkroot_full_dry_t', 'mkroot-full.py')
+        from targets import TARGETS
+        self.addCleanup(rp.set_backend, None)
+        for target in ('ios18', 'ios26'):
+            for backend in (rp.Linux, rp.MacOS):
+                with self.subTest(target=target, backend=backend.__name__), tempfile.TemporaryDirectory() as t:
+                    profile = dict(root.TARGET, **TARGETS[target], name=target)
+                    source = os.path.join(t, 'not-downloaded')
+                    image = os.path.join(t, 'root.img')
+                    rp.set_backend(backend(rp.Runner(dry=True)))
+                    with mock.patch.object(root, 'TARGET', profile), \
+                            mock.patch.object(root, 'W', os.path.join(t, 'work')), \
+                            mock.patch.object(sys, 'argv', ['mkroot-full.py', '--ipsw-dir', source, '--out', image]), \
+                            mock.patch.object(subprocess, 'run', side_effect=AssertionError('dry run executed a command')), \
+                            mock.patch.object(os, 'makedirs', side_effect=AssertionError('dry run created a directory')), \
+                            mock.patch.object(tempfile, 'mkdtemp', side_effect=AssertionError('dry run created signer files')), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        root.main()
+                    text = output.getvalue()
+                    self.assertIn(f'source paths use the {target} target profile', text)
+                    for dmg in profile['dmgs']:
+                        self.assertIn(os.path.join(source, dmg.removesuffix('.aea')), text)
+                    self.assertIn('root.simg', text)
+                    self.assertEqual(os.listdir(t), [])
+
+    def test_manifest_required_for_build_and_used_when_present_in_preview(self):
+        root = load('mkroot_full_manifest_t', 'mkroot-full.py')
+        with tempfile.TemporaryDirectory() as t:
+            with self.assertRaisesRegex(SystemExit, 'no BuildManifest.plist; run .*renegade fetch'):
+                root.find_dmgs(t)
+            manifest = {key: {'Info': {'Path': name}} for key, name in (
+                ('OS', 'custom-os.dmg.aea'), ('Cryptex1,SystemOS', 'custom-system.dmg.aea'),
+                ('Cryptex1,AppOS', 'custom-app.dmg'))}
+            with open(os.path.join(t, 'BuildManifest.plist'), 'wb') as f:
+                plistlib.dump({'BuildIdentities': [{'Manifest': manifest}]}, f)
+            expected = {key: os.path.join(t, name) for key, name in (
+                ('os', 'custom-os.dmg'), ('sysos', 'custom-system.dmg'), ('appos', 'custom-app.dmg'))}
+            self.assertEqual(root.find_dmgs(t), expected)
+            self.assertEqual(root.find_dmgs(t, dry=True), expected)
 
 
 class TestMacCommands(unittest.TestCase):

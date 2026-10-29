@@ -77,7 +77,7 @@ def detach(dev):
     rplat.detach(dev)
 
 
-def find_dmgs(d):
+def find_dmgs(d, *, dry=False):
     """OS, SystemOS and AppOS dmgs by BuildManifest path (decrypted names without .aea)."""
     import plistlib
     mf = None
@@ -85,7 +85,14 @@ def find_dmgs(d):
         if os.path.exists(c):
             mf = c
             break
-    m = plistlib.load(open(mf, 'rb'))['BuildIdentities'][0]['Manifest']
+    if mf is None:
+        if not dry:
+            sys.exit(f'{d}: no BuildManifest.plist; run tools/renegade/renegade fetch first')
+        print(f'# dry run: no BuildManifest.plist; source paths use the {TARGET["name"]} target profile')
+        return {name: os.path.join(d, p[:-4] if p.endswith('.aea') else p)
+                for name, p in zip(('os', 'sysos', 'appos'), TARGET['dmgs'])}
+    with open(mf, 'rb') as f:
+        m = plistlib.load(f)['BuildIdentities'][0]['Manifest']
     out = {}
     for key, name in (('OS', 'os'), ('Cryptex1,SystemOS', 'sysos'), ('Cryptex1,AppOS', 'appos')):
         p = m[key]['Info']['Path']
@@ -800,7 +807,6 @@ def main():
     if 'jb' in stages_ or 'tweaks' in stages_:
         roles.append('zstd')
     rplat.check_tools(*roles)
-    os.makedirs(W, exist_ok=True)
     rootmnt = os.path.join(W, 'root')
     # the jailbreak userland is part of the default build now (opt out: --no-jb / RENEGADE_NO_JB=1 / RENEGADE_JB=0)
     if (os.environ.get('RENEGADE_NO_JB') != '1' and os.environ.get('RENEGADE_JB') != '0' and 'jb' not in a.stages.split(',')
@@ -808,10 +814,11 @@ def main():
         st = a.stages.split(',')
         a.stages = ','.join(st[:st.index('seal')] + ['jb'] + st[st.index('seal'):]) if 'seal' in st else a.stages + ',jb'
     stages = a.stages.split(',')
-    dmgs = find_dmgs(a.ipsw_dir)
+    dmgs = find_dmgs(a.ipsw_dir, dry=rplat.backend().dry)
     if rplat.backend().dry:
         dry_plan(a, a.out, rootmnt, dmgs, stages)
         return
+    os.makedirs(W, exist_ok=True)
     if 'copy' not in stages and stages[0] in ('macho', 'cache', 'tweaks', 'jb') and not os.path.ismount(rootmnt):
         attach(a.out, rootmnt, readonly=False)
     for s in stages:

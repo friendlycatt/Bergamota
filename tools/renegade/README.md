@@ -2,15 +2,17 @@
 
 The Bergamota Project's patcher. iOS 18 ships every system binary as **arm64e** (pointer authentication), but the Poco F1's Snapdragon 845 is ARMv8.2 without PAuth. Renegade rewrites the code so it runs anyway, then builds the flashable root image around it. `renegade help` lists the commands.
 
+**Current target:** [`targets.py`](targets.py) defaults to **iOS 26.6.2 / 23G90 / iPhone12,1** (`RENEGADE_TARGET=ios26`), with output `research/ios26/ios26-root-full.simg`. Select `RENEGADE_TARGET=ios18` for the older **18.7.8 / 22H352 / iPhone11,8** workflow. The root profile selects Apple source files; board-specific drivers and boot packaging are separate. Galaxy S9 status and the applicable getting-started steps are in [`docs/STARLTE.md`](../../docs/STARLTE.md#getting-started-guide-review-for-s9).
+
 | Command | Tool | What |
 | --- | --- | --- |
 | `renegade strip IN [OUT]` / `scan` | `pacstrip.py` | Rewrites one Mach-O 4 bytes for 4 bytes (RETAA→RET, BRAA→BR, LDRAA→LDR, PAC/AUT/XPAC→NOP, PACGA→EOR ROR #13). `--sign` re-signs ad hoc, keeping the identifier, flags and entitlements |
 | `renegade cache DIR` | `pacstrip_cache.py` | Does the same over the dyld shared cache (main + sub-caches) and refreshes the CodeDirectory page hashes |
 | `renegade fips DIR --patch` | `fips_rehmac.py` | Recomputes corecrypto's FIPS POST HMAC over the rewritten `__text` |
-| `renegade fetch` | `fetch-root.sh` | Downloads and decrypts the 22H352 iPhone11,8 root and cryptex dmgs |
+| `renegade fetch` | `fetch-root.sh` | Downloads and decrypts the selected target's root and cryptex dmgs |
 | `renegade fetch-tools` | `berga_tools.py` | Downloads `berga-tools.zip` (the prebuilt on-device binaries) from the newest `berga-tools-vN` GitHub release (`--tag`, `--zip FILE`, `--status`), verifies SHA-256 and the manifest, unpacks it into `~/.cache/bergamota/berga-tools`. Python stdlib only |
 | `renegade root` | `mkroot-full.py` | Full root image: stages `copy, macho, cache, tweaks, seal`. macOS: no sudo (owners are set in the HFS+ catalog by `hfsroot_owners.py`); Linux: root, see Platforms |
-| `renegade boot` | `mkboot-full.sh` | Enxerto boot image for the root on `userdata` |
+| `renegade boot` | `mkboot-full.sh` | Poco F1 (`BOARD=beryllium`) Enxerto boot image for the root on `userdata` |
 | `renegade jb fetch\|stage\|live\|remove\|status` | `jailbreak.py` | Jailbreak userland (below); `mkroot-full.py` stage `jb`, on by default (`--no-jb`) |
 | `renegade update SIMG` | `update.py` | Applies the root auto-fixes to a finished image in place, no IPSW needed (below) |
 | `renegade hfs SIMG …` | `hfsx.py` | Reads the sparse root image in place: `ls`, `cat`, `get`, `find`, `dsc` |
@@ -73,6 +75,8 @@ git clone --recursive https://github.com/sgan81/apfs-fuse && cmake -S apfs-fuse 
 `ldid` needs no package: the pinned `ProcursusTeam/ldid` release (`v2.1.5-procursus7`, `ldid_linux_x86_64` / `ldid_linux_aarch64`) is downloaded into `research/jb/ldid-host-v2.1.5-procursus7/` and checked against the SHA-256 in `jailbreak.py` before it is ever run (`RENEGADE_LDID=/path` uses another build). opa334's fork, which `jailbreak.py` pins for the phone, publishes only the iOS binary; the Procursus ldid is the same code base.
 
 `RENEGADE_APFS_VOLUME=N` picks the APFS volume of the OS dmg (default 0). `RENEGADE_DRY_RUN=1 tools/renegade/renegade root ...` (also `update`) prints the commands of the platform layer and runs nothing; `RENEGADE_PLATFORM=linux` on a Mac builds the Linux command lines (`renegade platform --plan linux`). `renegade test` runs the unit tests (command construction of both backends, the dry-run flow, the tree copy, the feature gating, and on macOS codesign-vs-ldid parity).
+
+The `root` preview works before `fetch`: when `BuildManifest.plist` is absent, it reports source DMG paths from the selected target profile. A real manifest takes precedence when present, and actual root builds require it. Work/image directories and signer entitlement files are created only for real builds.
 
 Signing differences to know about: `ldid` writes a CodeDirectory version 2.4 (codesign: 2.5 with the exec-segment fields), adds a default requirements blob and no "Runtime Version". On a sample (thin arm64 and arm64e) the identifier, the CS flags (adhoc, hard, library-validation, runtime), the hash type (sha256 only) and the entitlements are identical to codesign's, and `codesign -v` accepts the result.
 

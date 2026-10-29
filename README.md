@@ -32,7 +32,7 @@ The Poco F1 boots the **unmodified iOS 18.7.8 userland of the iPhone XR** (`iPho
 > [!WARNING]
 > This is an experimental bring-up, not a usable phone OS. It installs into `userdata` and **erases Android's user data**. Apple's security model is mostly switched off, so do not put anything personal on it.
 
-**Galaxy S9 / iOS 26 bring-up:** the Exynos9810 `starlte` target has a successful full XNU26 build and a Samsung test `boot.img`. QEMU reaches CPU/IOKit initialization with readable verbose diagnostics; a physical S9 boot remains untested. See [`docs/STARLTE.md`](docs/STARLTE.md) for the image, hardware references and results, and [`tools/starlte-check`](tools/starlte-check) for the Linux/QEMU checks. The installation guide below describes the Poco F1.
+**Galaxy S9 / iOS 26 bring-up:** the physical Exynos9810 `starlte` display probe passes, and the user reports XNU output reaching missing-boot-media recovery with the Samsung refresh image. Samsung UFS access and an iOS root mount remain the next storage milestones. See [`docs/STARLTE.md`](docs/STARLTE.md) for the image, hardware references, results and S9 guide review, and [`tools/starlte-check`](tools/starlte-check) for the Linux/QEMU checks. The installation guide below describes the Poco F1.
 
 ## The boot chain
 
@@ -66,6 +66,8 @@ Qualcomm ABL (stock, unlocked)
 | Not working | Wi-Fi, cellular, Bluetooth, audio, camera, sensors, SEP / Face ID, GPU acceleration |
 
 ## Getting started
+
+These are the legacy **Poco F1 / iOS18** steps. This checkout's Renegade default is iOS26; use `export RENEGADE_TARGET=ios18` for the commands below. For **Galaxy S9 / iOS26**, follow the [S9 guide review](docs/STARLTE.md#getting-started-guide-review-for-s9).
 
 You need a Mac (the Renegade root step also runs on Linux, see 3b), a Poco F1 with an **unlocked bootloader**, and a backup of its partitions (see [`NOTES.md`](NOTES.md)).
 

@@ -4,13 +4,15 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F-class hardware),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-29:** the physical [display probe](#display-probe-1) reaches
-**PROBE READY** with readable Enxerto diagnostics and an RGB strip. The
-[XNU-enabled refresh image](#xnu-enabled-refresh-image) is verified and ready
-for the next hardware test. The full XNU26 CI build succeeded; QEMU executes
-VM, CPU and IOKit initialization with readable verbose diagnostics. Physical
-XNU execution, timer delivery, Samsung storage, touch, Mali GPU, USB and
-power-management support remain follow-up work.
+**Status, 2026-10-29:** the user reports that the
+[XNU-enabled refresh image](#xnu-enabled-refresh-image) now displays
+`Failed to write boot-picker-bringup-reason to NVRAM`. This matches XNU's
+[missing-boot-media path](#reported-xnu-root-device-wait), supporting physical
+XNU/BSD root-discovery progress. A full photograph/log is still needed;
+Samsung UFS access and an iOS root mount are not established. The physical
+[display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
+CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
+touch, Mali GPU, USB and power-management support remain follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The new kernel work is
@@ -146,9 +148,10 @@ preserved template metadata/second stage/DTBH/footer and legacy SHA-1.
 verification, provenance, photograph observations, README and ten-file
 `SHA256SUMS`. These artifacts are local and ignored by git.
 
-For the next user-controlled recovery test, install this image to **Boot**
-through TWRP / OrangeFox and photograph the last visible screen after reboot.
-Physical XNU startup is pending; the image includes no iOS root filesystem.
+After delivery, the user reports visible XNU output ending in the NVRAM
+message described [below](#reported-xnu-root-device-wait). The exact installed
+bytes and full surrounding screen have not been supplied. The image includes
+no iOS root filesystem.
 
 ### Initial full-kernel image
 
@@ -197,8 +200,8 @@ payload path passed to `build.sh` is copied to `out/starlte/payload.bin`.
 The raw ARM64 Image is position-independent and includes its BSS/stacks.
 [`tools/mkboot-starlte.py`](../tools/mkboot-starlte.py) wraps it and a
 SWEETXNU payload using the legacy Samsung layout described below. The
-physical probe established loader entry and live placement; the XNU
-handoff on the S9 remains to be tested.
+physical probe established loader entry and live placement; the later user
+report supports XNU/BSD execution on the S9.
 
 The implemented entry contract is:
 
@@ -226,7 +229,7 @@ while C and I are set. The earlier assumption of cache-enable bits being
 clear does not match this observation. `mmu_enable_ranges()` invalidates
 the image, payload and destination ranges plus the instruction cache before
 enabling its mappings. The physical probe holds before that mapping/loading
-path; the refresh image is the next test of it.
+path; the later refresh-image report supports progress through it into XNU.
 
 Starlte defaults to XNU26's **1024-byte** boot_args CommandLine: structure
 size 1152, `bootFlags` at 1136, `memSizeActual` at 1144. Existing Enxerto
@@ -305,6 +308,7 @@ translation support.
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43761664 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
 | Full-kernel QEMU | VM/CPU/IOKit initialization observed, 1/1 CPU and SGI1 verified; readable verbose screenshot; framebuffer-only decoder exits 3 (details below) |
+| Renegade platform/root preview | PASS, 24 tests and one macOS-only signer-parity skip; includes ios18/ios26 × Linux/macOS full previews before downloads |
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
 `cac36bd98fc5ed6c1c6cab7de24bddc069fc62cf16f705d073a9920374c890bf`.
@@ -313,8 +317,9 @@ The reconstruction uses XNU `xnu-12377.121.6` at
 `663906528d1cd5ea8fde7de6f16de73db9511549`.
 The freestanding guests establish component behavior. The full-kernel
 observations below extend this to QEMU startup execution. The physical
-probe establishes Enxerto entry and visible panel refresh. Physical XNU
-execution and an iOS root/userland boot have not been established.
+probe establishes Enxerto entry and visible panel refresh. The later user
+report supports physical XNU/BSD execution; an iOS root/userland boot has
+not been established.
 
 ## Full-kernel build and QEMU observations
 
@@ -456,31 +461,137 @@ photograph, rather than a binary register/FDT dump:
 
 Full manual transcription stays ignored in
 `research/starlte/device-probe-1/observation.json`. The held probe establishes
-loader/display progress; XNU execution, timer interrupt delivery and full
-RAM ownership remain open. The next image is the
-[XNU-enabled refresh build](#xnu-enabled-refresh-image).
+loader/display progress. The subsequent
+[XNU-enabled refresh build](#xnu-enabled-refresh-image) produced the user's
+XNU report below; timer interrupt delivery and full RAM ownership remain open.
+
+## Reported XNU root-device wait
+
+After refresh delivery, the user says it now works and copies
+`Failed to write boot picker bring up reason to nvram`. No new photograph
+or complete log accompanied the report. In the prepared XNU tree:
+
+* `iokit/bsddev/IOKitBSDInit.cpp:960` calls
+  `IOSetRecoveryBoot(BSD_BOOTFAIL_MEDIA_MISSING, NULL, true)` after root-device
+  matching times out.
+* Lines 609–615 try to store `boot-picker-bringup-reason = missing-boot-media`
+  and emit the matching NVRAM error. Lines 630–642 subsequently wait for
+  `IODTNVRAM` / `IONVRAM`, which can explain why the screen stops there.
+
+The report therefore supports physical XNU/BSD root discovery. The NVRAM
+error is secondary to missing boot media. Fixing NVRAM alone would not supply
+a root device.
+
+An inspection of the delivered refresh image confirms that its payload has
+no RAMDisk, `rd=` / `rootdev=` argument, `/chosen/root-matching` or boot UUID.
+Its starlte ADT omits `/sweet-ufs` (`tools/mkadt.py`: `ufs=False`). The current
+`bsd/dev/sweet_ufs.c:1036–1040` returns `ENXIO` without that node. Thus flashing
+an iOS filesystem to userdata alone cannot make this kernel read it.
+
+### Samsung storage prerequisites
+
+The [pinned Samsung driver][samsung-ufs] and DTS identify:
+
+| Item | Reference finding | Consequence for the current XNU driver |
+| --- | --- | --- |
+| Registers | HCI `0x11120000`, vendor HCI `0x11121100` | Board-specific mapping and inherited host/link-state validation |
+| Descriptor units | `UFSHCD_QUIRK_PRDT_BYTE_GRAN`, `ufs-exynos.c:559`; [ufshcd.c][samsung-ufshcd]:1695,3235 | Samsung uses byte offsets/lengths; XNU currently uses DWORD offsets and a PRDT entry count at `sweet_ufs.c:264–273` |
+| PRDT layout | `PRDT_SET_SIZE(12)` at `ufs-exynos.c:442–444` | Validate the vendor entry layout/stride and crypto fields before constructing requests |
+| DMA addressing | `DMA_BIT_MASK(32)` at `ufs-exynos.c:1216,1273` | XNU currently allocates descriptors/bounce memory from the entirely-above-4-GiB bank `0x880000000 + 0x80000000` |
+
+The 32-bit DMA mask is a **source-derived restriction**, not a measured
+hardware capability. Read the inherited controller state and resolve a
+verified DMA-addressable buffer arrangement before submitting requests;
+changing only the ADT register address is insufficient. The first storage
+milestone is read-only LUN/GPT discovery and bounded reads of the existing
+`userdata` partition.
+
+## Getting-started guide review for S9
+
+The pasted guide describes Poco F1 / Qualcomm and older iOS18 defaults.
+For this checkout and phone:
+
+| Guide step | S9 / iOS26 equivalent |
+| --- | --- |
+| 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patch 1131, fork `friendlycatt/Bergamota`; successful run **40826795487** already supplies the kernel. Future dispatches need `macos_version=26.5`. |
+| 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
+| 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
+| 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
+| 4: `mkboot-full.sh` | This helper explicitly forces `BOARD=beryllium` at line 32. S9 uses `mkpayload.py`, the starlte loader and `mkboot-starlte.py`. |
+| 5: Poco ABL/Bergamota fastboot flashing | The current S9 route is TWRP / OrangeFox with Samsung boot images. Bergamota's Qualcomm USB/UFS flashing path is not established on this phone. |
+
+[`targets.py`](../tools/renegade/targets.py) selects **iOS 26.6.2 / 23G90 /
+iPhone12,1 / N104AP** by default. The expected root output is
+`research/ios26/ios26-root-full.simg`. Preview the Python root workflow before
+downloading anything:
+
+```sh
+RENEGADE_TARGET=ios26 RENEGADE_DRY_RUN=1 tools/renegade/renegade root
+```
+
+The reviewed command exits **0** on this Linux host. The preview now uses
+profile-derived decrypted DMG names when the manifest is absent and respects
+dry mode for macOS excluded-tree copies and signer entitlement files. Real
+builds still require `BuildManifest.plist`; a downloaded manifest takes
+precedence in previews too. The platform suite passes **24 tests**, with one
+macOS-only signer-parity test skipped; its four full-preview cases cover
+ios18/ios26 × Linux/macOS without work/image creation or subprocess execution.
+
+This host is **CachyOS (Arch-based)**, so the guide's `apt install` line needs
+distribution-specific packages. At review time it had about **61 GiB free**,
+but `ipsw`, `apfs-fuse`, `mkfs.hfsplus`, `fsck.hfsplus` and optional
+`dropbearkey` were absent from PATH. After those prerequisites are supplied,
+the root-preparation sequence is:
+
+```sh
+RENEGADE_TARGET=ios26 tools/renegade/renegade fetch-tools
+RENEGADE_TARGET=ios26 tools/renegade/renegade fetch
+sudo -E env RENEGADE_TARGET=ios26 tools/renegade/renegade root
+```
+
+No real root build has been performed in this checkout. The default raw image
+is 20 GiB logical size, with additional space needed for source volumes and
+scratch files. Linux mounting/formatting and the resulting filesystem still
+need validation with the actual IPSW.
+
+Once Samsung storage is working, root selection can use `rd=ufsroot0`
+(`ufsroot=userdata` is the default partition); arm64e userspace also needs
+`sweetarm64e=1`. The full boot arguments need an S9-specific review before
+enabling writable root/userland. Installation targets the existing userdata
+partition, with confirmation before its destructive write as required by
+`AGENTS.md`.
+
+Local evidence is in ignored `research/starlte/root-bringup-review/`: the
+user observation, payload/ADT and source audit, original failing preview,
+fixed preview and platform-test logs. Kernel CI remains **40826795487**;
+this review creates no new boot image or hardware boot result.
 
 ## Next milestones
 
-1. **Single-core XNU device progress.** Test `boot-starlte-xnu26-refresh.img`
-   through the user's recovery route and capture the last visible screen.
-   Establish loader mapping/payload handoff and early XNU execution.
-   Device writes require the confirmations in `AGENTS.md`.
-2. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
+1. **Read-only Samsung storage.** Resolve UFS descriptor/DMA requirements,
+   validate the inherited host state, then read LUN capacity/GPT and bounded
+   userdata blocks. Prepare and verify the iOS26 root after host prerequisites
+   are available; a userdata write needs explicit confirmation.
+2. **Complete the physical XNU record.** Obtain a photograph of the full
+   last-visible screen surrounding the reported missing-media/NVRAM message.
+3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
    observed zero `CNTFRQ_EL0` register.
-3. **Complete live hardware facts.** Resolve RAM reservations/firmware
+4. **Complete live hardware facts.** Resolve RAM reservations/firmware
    allocations and the inherited display's stride/format/IOMMU state.
    Keep dumps and device identifiers under ignored `research/`, `dtb/`
    or `backup/` paths.
-4. **Console follow-up.** Complete framebuffer-serial initialization when
+5. **Console follow-up.** Complete framebuffer-serial initialization when
    it is the only registered interface; teach QEMU diagnostics to account
    for the themed video console or consume the captured log ring.
-5. **Samsung peripherals and root boot.** Storage, sustained display, USB,
-   input and power support are needed before an iOS userland boot can be
-   claimed; Mali acceleration is a separate hardware-driver effort.
+6. **Root boot and Samsung peripherals.** Validate the root mount and
+   userspace startup, then sustained display, USB, input and power support.
+   Mali acceleration is a separate hardware-driver effort.
 
 [samsung]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/arch/arm64/boot/dts/exynos/exynos9810-starlte_eur_open_26.dts
+[samsung-ufs]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufs-exynos.c
+[samsung-ufshcd]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufshcd.c
 [mu]: https://github.com/Project-Silicium/Mu-Silicium/tree/7a2ada19841a129f86fb791c0b9a710436c849a4
 [mu-dts]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Resources/DTBs/starlte.dts
 [mu-memory]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Platforms/Samsung/starltePkg/Library/MemoryMapLib/MemoryMapLib.c
