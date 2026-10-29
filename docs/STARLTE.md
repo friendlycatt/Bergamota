@@ -174,16 +174,18 @@ startup, Samsung firmware and physical device behavior remain untested.
 
 ## Next milestones
 
-1. **Full XNU26 build.** GitHub CLI is currently unauthenticated in this
-   checkout. Once authenticated and the changes are on the remote ref,
-   explicitly dispatch 26.5: `develop` otherwise defaults to 15.3.
+1. **Full XNU26 build.** GitHub CLI is authenticated as `friendlycatt`, and
+   the S9 changes are pushed to the user's `friendlycatt/Bergamota` fork.
+   [Run 40826795487](https://github.com/friendlycatt/Bergamota/actions/runs/40826795487)
+   builds commit `46ccb6552bb5da6115af4df3c737090e3a7ecbc9`; its outcome is
+   pending. Explicitly dispatch 26.5: `develop` otherwise defaults to 15.3.
 
    ```sh
-   gh workflow run xnu.yml -R ry-diffusion/bergamota --ref develop \
+   gh workflow run xnu.yml -R friendlycatt/Bergamota --ref develop \
        -f macos_version=26.5 -f machine_config=SWEET -f kernel_config=DEVELOPMENT
-   gh run list -R ry-diffusion/bergamota --workflow xnu.yml --branch develop --limit 5
-   gh run view RUN_ID -R ry-diffusion/bergamota --log
-   gh run download RUN_ID -R ry-diffusion/bergamota -n xnu-kernel -D xnu/out-starlte
+   gh run list -R friendlycatt/Bergamota --workflow xnu.yml --branch develop --limit 5
+   gh run view RUN_ID -R friendlycatt/Bergamota --log
+   gh run download RUN_ID -R friendlycatt/Bergamota -n xnu-kernel -D xnu/out-starlte
    ```
 
    Record the actual run ID, logs and artifact hash in `NOTES.md`; the
