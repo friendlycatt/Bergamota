@@ -4,7 +4,20 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F / G960FD),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-30:** the new [startup-candidate photograph](#photographed-startup-candidate-result)
+**Latest hardware result, 2026-10-30:** the pre-HCE correction now reaches a
+clean clearing confirmation, successful LINKSTARTUP (TX/RX 2/2, CPort 1) and
+**NOP IN result 0**. First TEST UNIT READY returns **OCS 7 / UPIU 21 / response 1 /
+status 2 / sense 06/29/00**, then **FAILED (5), writes 0, commands failed 1**.
+Samsung's pinned `ufshcd.c:4577–4595` decodes SCSI replies for OCS_FATAL_ERROR;
+our unconditional Exynos rejection prevents handling this reset Unit Attention.
+Patch **1138** adds one validated no-data TUR reset-UA retry per LUN after NOP,
+requiring current fixed-format sense, valid lengths/identity and a fresh clean
+host/list/base/UIC sample. Persistent UA and other OCS errors still quarantine.
+Local checks pass **527 host / 24 ADT / fatal sanitizers / real-header compile**;
+fresh reconstruction passes **281 patches / 6369 files**, including the complete
+pre-1138 baseline. New CI/image and physical capacity/GPT/reads remain pending.
+
+**Previous failure, 2026-10-30:** the [startup-candidate photograph](#photographed-startup-candidate-result)
 stops **before HCE enable**, with **IS=0 / HCE=0 / HCS=0x10f / idle DBRs /
 PA=`0x80000010` / other layers zero**: **FAILED (5), writes 0, commands failed 0 /
 PROBE HOLD**. This pre-enable EIO is not another measured TUR timeout.

@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -202,6 +202,7 @@
+ 	bool attempted;
+ 	bool boundary_probe;                    /* exact Exynos board and ufsprobe=1 */
+ 	bool link_init, nop_ready;               /* opt-in warm-start/UTP experiment */
++	uint8_t tur_reset_retried;               /* at most one Samsung reset UA per LUN */
+ 	uint8_t boundary_seen, boundary_logged;
+ 	struct exynos_ufs_boundary boundary[4]; /* enable/TUR/NOP/clear, retained for this boot */
+ 	int init_error;
+@@ -947,6 +948,40 @@
+ 			    "sense key 0x%x asc 0x%02x ascq 0x%02x\n", cdb[0], ocs, ucd->resp[0], ucd->resp[6],
+ 			    ucd->resp[7], sense >> 16, (sense >> 8) & 0xff, sense & 0xff);
+ 		}
++		/* Samsung 9810 ufshcd_transfer_rsp_status decodes SCSI responses
++		 * for OCS_FATAL_ERROR too. Permit only a current, complete reset UA
++		 * from the no-data TUR after our NOP handshake, once per LUN. This
++		 * remains a failed attempt, never a successful SCSI/data transfer.
++		 */
++		bool reset_ua = su.exynos && su.boundary_probe && su.link_init && su.nop_ready &&
++		    su.lun < 8 && !(su.tur_reset_retried & (1u << su.lun)) &&
++		    cdb_len == 6 && !len && !write && !cdb[0] && !cdb[1] && !cdb[2] &&
++		    !cdb[3] && !cdb[4] && !cdb[5] && ocs == 7 && ucd->resp[0] == 0x21 &&
++		    !ucd->resp[1] && !ucd->resp[4] && !ucd->resp[5] &&
++		    ucd->resp[6] == 1 && ucd->resp[7] == SCSI_CHECK_CONDITION &&
++		    !ucd->resp[8] && !be32(ucd->resp + 12) &&
++		    slen >= 18 && slen <= sizeof(ucd->resp) - 34 &&
++		    ((unsigned)ucd->resp[10] << 8 | ucd->resp[11]) == slen + 2 &&
++		    (ucd->resp[34] & 0x7f) == 0x70 && ucd->resp[41] >= 10 &&
++		    (unsigned)ucd->resp[41] + 8 <= slen && sense == 0x062900;
++		if (reset_ua) {
++			struct exynos_ufs_sample terminal;
++			exynos_ufs_capture(&terminal, ufs_rd(REG_IS));
++			exynos_ufs_log_sample(&terminal, "TUR-reset-UA", cdb[0]);
++			bool clean = !((is | terminal.is) & UFS_IS_ERR_MASK) && terminal.hce == 1 &&
++			    (terminal.hcs & 0xffu) == HCS_EXYNOS_RDY &&
++			    !terminal.dbr && !terminal.dbr_after && !terminal.tm_dbr &&
++			    terminal.rsr == 1 && !terminal.tm_rsr &&
++			    terminal.base == (uint32_t)(su.dma_pa + DMA_UTRL) &&
++			    terminal.baseu == (uint32_t)((su.dma_pa + DMA_UTRL) >> 32);
++			for (unsigned i = 0; i < 5; i++) { clean = clean && !terminal.uic[i]; }
++			if (clean) {
++				su.tur_reset_retried |= 1u << su.lun;
++				*retry = true;
++				printf("STARLTE UFS: TUR reset Unit Attention, bounded retry lun %u\n", su.lun);
++				return EIO;
++			}
++		}
+ 		/*
+ 		 * Transient: UNIT ATTENTION (6) / NOT READY (2) after a link or power event, BUSY and
+ 		 * TASK SET FULL, and a failed transfer (OCS 5 communication failure, 7 fatal) on an

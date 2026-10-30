@@ -208,7 +208,7 @@ device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**501 host scenarios** exercise:
+**527 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
@@ -270,9 +270,15 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
   The optional two-line confirmation prints only once at the hold, from RAM.
   Later UIC/NOP/TUR errors cannot reuse this allowance. These 172 added scenarios
   establish bounded software behavior, not the phone's read-clear mechanism.
+* Samsung OCS7/response1 reset Unit Attention: one validated no-data TUR retry
+  per LUN after NOP. Malformed response identity, flags, residual, sense/segment
+  lengths, wrong sense and missing opt-ins reject; a sampled PA error rejects.
+  Full startup/NOP fixtures reach synthetic capacity/GPT/repeated reads after
+  one reset UA, and quarantine on persistent UA. These 26 cases supplement the
+  existing generic OCS, timeout, response and DMA ownership rejection tests.
 * Capacity/block-size validation, READ CAPACITY(16), READ(16) beyond 32-bit
   LBAs, LUNs 0–7, mixed geometries, strict GPT CRC/geometry/partition bounds,
-  exact case-insensitive names and mismatched or missing repeated reads.
+   exact case-insensitive names and mismatched or missing repeated reads.
 * Four-byte-aligned ADT data, malformed ownership descriptions, mapping
   failures before MMIO, BSD chunking/residuals/overflow checks, and successful
   or failed probe holds before registration.
@@ -300,8 +306,12 @@ The pre-enable correction passes **501/24** in the worktree's
 sanitizers and complete real-header compilation. Additive patch 1137 passes
 forward/reverse application and fresh reconstruction in
 `research/starlte/series-check-preenable-linereset/` (**280 patches / 6369 files**),
-including the full pre-1137 baseline inventory. Commit/push and a replacement
-CI image/physical test remain next. Main-checkout probe 4 remains
+including the full pre-1137 baseline inventory. Its e1458e3 / CI 41122349335
+image physically clears the pre-HCE indication, starts the link and completes
+NOP. TUR then reports OCS7/response1/status2/sense06/29/00. The reset-UA correction
+passes 527/24 in `tur-reset-check-2/`; patch 1138 reconstructs in
+`series-check-tur-reset/` (281 patches / 6369 files, complete pre-1138 baseline).
+Its CI/image and physical media test are pending. Main-checkout probe 4 remains
 pinned to source `2347574`; physical Samsung media reads/root mount are unverified.
 
 ### Reset and final framebuffer: `reset.py`

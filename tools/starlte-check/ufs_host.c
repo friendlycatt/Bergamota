@@ -232,6 +232,8 @@ struct model {
 	int fault_op;
 	enum fault fault;
 	uint8_t key, asc, ascq;
+	uint8_t sense_ocs, sense_response;
+	unsigned sense_mutate_offset;
 	uint8_t last_cdb[16];
 	uint8_t *allocation, *dma;
 	uint64_t pending_pa;
@@ -531,6 +533,11 @@ static void model_command(void)
 		resp[41] = 10;
 		resp[46] = d->present ? m.asc : 0x25; /* LOGICAL UNIT NOT SUPPORTED */
 		resp[47] = d->present ? m.ascq : 0;
+		if (fault == SENSE) {
+			put_le32(t + 8, m.sense_ocs);
+			resp[6] = m.sense_response;
+			if (m.sense_mutate_offset) { resp[m.sense_mutate_offset] ^= 1; }
+		}
 	} else if (fault == BUSY || fault == FULL) {
 		resp[7] = fault == BUSY ? 8 : 0x28;
 	} else {
@@ -1318,6 +1325,34 @@ static void test_failures(void)
 	transport(true, 4096); m.disks[0].present = false;
 	CHECK(ufs_read_capacity() == EIO && m.commands == 1 && !su.dead && ss.last_sense == 0x52500);
 	passed(case_name);
+	for (unsigned i = 0; i < 24; i++) {
+		case_name = "Samsung TUR reset UA: exact response, bounded retry and rejection guards";
+		transport(true, 4096);
+		su.link_init = su.nop_ready = su.boundary_probe = true;
+		su.boundary_seen = 7;
+		m.key = 6; m.asc = 0x29; m.sense_ocs = 7; m.sense_response = 1;
+		uint8_t tur[6] = { 0 };
+		static const unsigned offsets[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 32, 33, 34, 36, 46, 47 };
+		if (i >= 2 && i < 20) { m.sense_mutate_offset = offsets[i - 2]; }
+		if (i == 2) { m.sense_ocs = 5; } /* offset zero disables mutation */
+		if (i == 20) { su.nop_ready = false; }
+		if (i == 21) { su.link_init = false; }
+		if (i == 22) { su.boundary_probe = false; }
+		if (i == 23) { m.r[0x38 / 4] = 0x80000010; }
+		inject(SENSE, i == 1 ? 20 : 1, 0);
+		int result = ufs_scsi(tur, sizeof(tur), 0, false);
+		if (i == 0) {
+			CHECK(result == 0 && !su.dead && m.commands == 2 && ss.retries == 1);
+			CHECK(su.tur_reset_retried == 1 && ss.cmd_failures == 1 && ss.last_sense == 0x062900);
+			CHECK(ufs_read_capacity() == 0 && ufs_read_blocks(0x100, 1) == 0);
+		} else if (i == 1) {
+			CHECK(result == EIO && su.dead && m.commands == 2 && ss.retries == 1);
+		} else {
+			CHECK(result == EIO && ss.retries == 0 && m.commands <= 1);
+		}
+		CHECK(!m.writes);
+		passed(case_name);
+	}
 }
 
 static unsigned occurrences(const char *needle)
@@ -1768,6 +1803,21 @@ static void test_preenable_linereset(void)
 
 static void test_link_startup(void)
 {
+	for (unsigned persistent = 0; persistent < 2; persistent++) {
+		case_name = "warm startup and NOP followed by Samsung reset UA TUR";
+		warm_probe(false);
+		m.key = 6; m.asc = 0x29; m.sense_ocs = 7; m.sense_response = 1;
+		inject(SENSE, persistent ? 20 : 1, 0);
+		probe_to_hold();
+		CHECK(m.link_starts == 1 && m.nops == 1 && m.opcount[0] == 2);
+		CHECK(ss.retries == 1 && !m.writes && su.nop_ready);
+		CHECK(su.dead == (bool)persistent);
+		if (!persistent) {
+			CHECK(ss.reads >= 4 && occurrences("probe PASSED (0)") == 1);
+			CHECK(su.device_blocks == 0x10000 && su.first_block == 0x100);
+		} else { CHECK(!ss.reads && occurrences("probe FAILED (5)") == 1); }
+		passed(case_name);
+	}
 	for (unsigned state = 0; state < 3; state++) {
 		bool enabled = state == 2;
 		case_name = enabled ? "inherited enabled link receives GET/NOP checks without LINKSTARTUP" :
