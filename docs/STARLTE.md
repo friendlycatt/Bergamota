@@ -15,7 +15,7 @@ on `starlte/ufs-link-startup`, addresses the missing post-HCE transport sequence
 **329 host scenarios / 24 ADT cases / real-header compile** and
 **279-patch / 6369-file reconstruction PASS**. Source **ec7a619** is pushed;
 [Intel CI 41092452347](https://github.com/friendlycatt/Bergamota/actions/runs/41092452347)
-is dispatched. The candidate loader/ADTs and **6374 pre-fixed expected CI source
+completed successfully on attempt 1. The candidate loader/ADTs and **6374 pre-fixed expected CI source
 hashes** are prepared; kernel inspection, image packaging and physical validation
 are next.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
@@ -1365,6 +1365,13 @@ Its SHA256 is **`8744dac99cc42080fdba80d7c70f3e6a438ceebe036938b6a0708ef15b11b3b
 The delivery suite preserves the established exception and snapshot policies;
 their six implementation helpers are unchanged. Download/CI inspection, actual
 image packaging and a new full-kernel QEMU capture are still pending.
+
+CI **41092452347 / ec7a619 / attempt 1** completed successfully **17:18:24Z**,
+job **124189568585**. Its build step ran **16:43:55–17:15:44Z**; actual host
+selection is **x86_64 / Xcode 26.1.1 / 17B100**. The completed watcher saved
+the final run, job, artifact metadata and Actions log. Recorded artifact IDs
+**12996987051** (kernel) and **12995539243** (buildtree) are being downloaded
+and verified against their GitHub ZIP digests and the pre-fixed source inventory.
 
 ## Getting-started guide review for S9
 
