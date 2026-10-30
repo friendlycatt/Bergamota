@@ -25,10 +25,10 @@ startup guard; the [narrowly gated clearing correction](#narrow-pre-hce-linerese
 in additive patch **1137** passes **501 host / 24 ADT / fatal sanitizers /
 real-header compilation / 280-patch / 6369-file reconstruction**. Source
 **e1458e3** is pushed; [Intel CI 41122349335](https://github.com/friendlycatt/Bergamota/actions/runs/41122349335)
-succeeded, attempt 1, **21:10:21Z**. Replacement delivery inputs and all 6374
-expected CI source hashes are pinned; artifact verification and packaging are
-underway.
-UIC/NOP/TUR stay strict.
+succeeded, attempt 1, **21:10:21Z**. All **6374 actual CI source hashes**, the
+new kernel, Samsung image and 90-second QEMU hold verify. The **10461200-byte
+[replacement image](#pre-hce-correction-delivery)** is finalized and ready for
+an S9 test, **21:38:14Z**. UIC/NOP/TUR stay strict.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
 **Samsung media reads and an iOS root mount
@@ -345,11 +345,11 @@ translation support.
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
 | UFS (`ufs.py`) | PASS, 501 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing and deferred boundary output |
-| Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; frozen startup CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
-| Full XNU26 CI build | PASS, correction e1458e3 / 41122349335 / attempt 1, Intel host and Xcode 26.1.1 verified; actual replacement kernel/source inspection pending |
+| Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; fresh CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
+| Full XNU26 CI build | PASS, correction e1458e3 / 41122349335 / attempt 1; actual ARM64 Mach-O, all 6374 source hashes, 36 UFS markers, 280 ordered patches, Intel host and Xcode 26.1.1 verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
-| Full-kernel QEMU | Probe-3 checker and corrected independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 6920 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
+| Full-kernel QEMU | Pre-HCE correction checker and independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 7012 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
 | Renegade platform/root preview | PASS, 24 tests and one macOS-only signer-parity skip; includes ios18/ios26 × Linux/macOS full previews before downloads |
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
@@ -1518,8 +1518,14 @@ is committed/pushed; [Intel CI **41122349335**](https://github.com/friendlycatt/
 **20:21:21–21:06:33Z** used the reviewed 26.5/DEVELOPMENT/SWEET/Xcode26.1 inputs;
 actual Deps report **x86_64 / Xcode 26.1.1 / 17B100**. Completion review passes
 **21:29:40Z**. Frozen artifact IDs are kernel **13012226676** and buildtree
-**13012885204**, each with a recorded GitHub ZIP SHA256. Download, complete
-source replay/inspection and replacement packaging are underway.
+**13012885204**; both downloaded ZIP SHA256s match GitHub metadata. Complete
+source replay/inspection passes **21:32:54Z**, all 6374 files and 280 ordered
+patches exact, including the complete pre-1137 baseline. The actual ARM64
+Mach-O has all 36 UFS markers, **22213976 bytes**, SHA256
+**`ffe06de34ed46d5988d6b5081876143a956ee0ac48784c59504d55c2b2896e54`**.
+`errors.txt` is empty. All 58 linker-summary lines were reviewed: interleaved
+warning/include fragments and duplicate-library/segment-order warnings followed
+by DSYMUTIL; no established linker failure.
 
 Fresh **`preenable-linereset-bringup/package_probe.py --prepare`** exits **0**,
 **20:38:09Z**; input review passes **20:47:10Z**. The separate
@@ -1531,12 +1537,51 @@ download/archive inspection from the local reconstruction, six dxb substitutions
 and nine reviewed headers. Inventory SHA256:
 **`c076a7d68ace85b766c832571b25d03e0dc84ab84325e02dc65def8e95dc188b`**;
 only `bsd/dev/sweet_ufs.c` differs from the frozen startup expectations.
-All six exception/snapshot helper ASTs match the previous delivery. The planned
-capture uses fresh **`preenable-linereset-qemu-41122349335/`** and short alias
+All six exception/snapshot helper ASTs match the previous delivery. The fresh
+capture uses **`preenable-linereset-qemu-41122349335/`** and short alias
 **`/tmp/opencode/upc-41122349335`**, with the same exception/snapshot policies.
 Evidence and fixed script pins are in
-**`preenable-linereset-bringup/preparation-review.json`**. Packaging, raw-image
-verification and QEMU capture/audit await successful artifact inspection.
+**`preenable-linereset-bringup/preparation-review.json`**.
+
+#### Pre-HCE correction delivery
+
+The replacement S9 image is ready:
+
+```text
+/home/friendlycatt/Bergamota/research/starlte/ufs-link-startup-work/enxerto/out/starlte/boot-starlte-ufs-preenable-linereset.img
+```
+
+**10461200 bytes**, adjacent **`.img.sha256`**. SHA256:
+
+```text
+5ff018ef4da1a78309341a617ee763c0f8fe4389ccd064fd50a51f3e491ee5e9
+```
+
+Actual packaging passes **21:33:56Z**, independent raw Samsung/payload audit
+**21:34:38Z**. It uses the supplied Lineage Samsung template and checked normal
+Image. The production host loader compares **43778048 RAM bytes exact**; raw
+audit verifies every loaded CI segment, hardware UniPro/zero-placeholder ADT,
+exact opt-in arguments, template metadata, DTBH/footer and legacy SHA-1.
+
+Fresh QEMU capture checker **0, 21:36:08Z**, independent audit **0, 21:36:57Z**:
+**90 seconds / 7078 console bytes / 7012 IRQs and one verified retried Skywalk
+demand fault / rootvnode=early_panicking=0 / `_cpu_idle + 0x220`**. The actual
+screenshot was viewed: readable missing-node **FAILED (6), writes 0, commands
+failed 0 / PROBE HOLD**. Underlying runner **3 / `blank_screen`** is the existing
+colored-console decoder limitation. Exception and snapshot policies are unchanged;
+QEMU has no Samsung UFS device.
+
+Finalization passes **21:37:33Z** and independent delivery verification
+**21:38:14Z**. **`research/starlte/preenable-linereset-delivery/`** contains the
+image, final receipt/README, checks, ten reproduction scripts and verified
+**66-entry `SHA256SUMS`**, manifest SHA256
+**`93b3d737fbc0d4e282dfed6048663780a5ca976d12d9115e3e83b2cbee6bf69f`**.
+`delivery-final.json` supersedes the initial packaging status in `delivery.json`.
+All 356 candidate source hashes and 6587 protected files still match.
+
+Use the existing **TWRP / OrangeFox** Samsung boot-image procedure. Send a complete
+held-output photograph, especially **pre-enable / pre-HCE-clear**, UIC/warm-link,
+NOP, capacity/GPT/read CRC and final counters, or the last visible line.
 
 Physical clearing, startup/NOP/TUR, descriptor/response/data DMA,
 capacity/GPT/repeated userdata reads and root mount remain unverified; no agent
@@ -1606,10 +1651,9 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Inspect the dispatched build of the locally
-   validated/reconstructed [pre-HCE correction](#narrow-pre-hce-linereset-correction), then
-   package a fresh startup/NOP image using the supplied Samsung template
-   and 512-byte UPIU layout. Keep all transfer checks strict. Obtain actual LUN
+1. **Read-only Samsung storage.** Test the finalized
+   [pre-HCE correction image](#pre-hce-correction-delivery) through the existing
+   TWRP / OrangeFox procedure. Keep all transfer checks strict. Obtain actual LUN
    capacity/GPT and repeated userdata reads before preparing the iOS26 root.
    A destructive userdata operation needs separate confirmation; no GPT changes.
 2. **Extend the physical XNU record.** Probe 3's photograph and source review
