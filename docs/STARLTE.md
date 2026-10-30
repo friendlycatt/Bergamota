@@ -8,11 +8,14 @@ different board descriptions.
 shows the bounded **HCE enable succeeded** (`HCE=1`, `HCS=0x10f`, `IS=0`) and
 the **FMP format call returned 0**. The first TEST UNIT READY command then
 **timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
-The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
+The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and
 delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
 **4d12ded**. All **6374 source files**, the diagnostic binary and independent
-Samsung/payload audit verify; the fresh QEMU capture and corrected independent
-audit pass. Real finalization and archive verification remain pending.
+Samsung/payload audit verify; the QEMU capture and corrected independent
+audit pass. [Probe-3 software delivery](#ufs-probe-3-software-delivery) is now
+**complete**: real finalization and independent delivery audit both exit **0**,
+all **189 manifest entries / 190 archive files exact**. The next result is the
+whole-screen phone photograph, not another software build or audit.
 **Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
@@ -1013,8 +1016,9 @@ guards** pass, with **189 fixture manifest entries / 190 archive files exact**.
 The separately recorded **real v3 independent audit exits 0**, validates all
 eight CI-source references and all 13 unchanged capture hashes, and retains the
 unchanged exception and narrowly verified IRQ-site policies. The final paused
-IRQ's return is still unobserved. Real finalization/archive verification remain
-pending. The current phone result remains probe 2's timeout.
+IRQ's return is still unobserved. Real finalization and independent archive
+verification are now complete, as recorded below. The current phone result
+remains probe 2's timeout.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
@@ -1042,9 +1046,76 @@ fresh seeds/source unchanged and independent Samsung section/metadata/SHA-1
 checks. These are **not probe-3 CI, Samsung storage or phone execution results**.
 Real artifacts now pass download/reconciliation/inspection, Samsung packaging and
 independent raw-image verification and the capture checker/actual visual review.
-The corrected real IRQ-snapshot audit passes; finalization and archive review
-remain next. Neither failed audit was relabeled. QEMU has no Samsung UFS and
+The corrected real IRQ-snapshot audit, finalization and independent archive
+review pass. Neither failed audit was relabeled. QEMU has no Samsung UFS and
 cannot validate HCE/FMP/UIC/data DMA.
+
+### UFS probe 3 software delivery
+
+**Complete, independently verified read-only diagnostic delivery** for the
+user-identified **SM-G960F / G960FD**, not an iOS installation or root/userland boot.
+
+**Test image:** `enxerto/out/starlte/boot-starlte-ufs-probe-3.img`, **10461200 bytes**,
+with adjacent `boot-starlte-ufs-probe-3.img.sha256`:
+
+```text
+2f17f8dc2ba9fe5a4ed5bfb838c6e2b4c476d4a4615384e7c745ea6d276f07b4
+```
+
+**Final bundle:** `enxerto/out/starlte/starlte-ufs-probe-3-41014066730.tar.gz`,
+**30972661 bytes**, with adjacent `starlte-ufs-probe-3-41014066730.tar.gz.sha256`:
+
+```text
+11eca4f8009c86fe2557c300e3b663e8e8ce1c95908a3222fe7016412ba5b42e
+```
+
+The real `finish_probe.py --qemu-out research/starlte/ufs-probe-3-qemu-41014066730 --screen-reviewed`
+exits **0**, **2026-10-30T08:36:20–08:36:27Z**. Separately
+executed `independent-audit/delivery.py` exits **0**, **08:38:53–08:38:59Z**:
+all **189 actual manifest entries / 190 archive files**, both standalone
+checksums, **352 source hashes / 498 protected prior artifacts / 13 reproduction
+scripts / 194 ignored artifact paths** verify. No mocks were used in either
+actual command; matching counts in the synthetic fixture are not the delivery proof.
+
+Frozen `research/starlte/ufs-probe-3-delivery/` contains the image, CI kernel,
+loader/payloads/ADTs, exact CI-source evidence, raw QEMU capture and independent
+raw-image/QEMU audits, plus the preserved failed v1/v2 audits and failed v3
+reporting guard. Preparation/packaging `source.json` / `delivery.json` remain
+separate from `source-final.json` / `delivery-final.json`. The manifest covers
+every other file. The **late independent delivery-audit results and final
+documentation remain outside the frozen bundle**; no archive or delivery file
+was changed for them.
+Both wrappers verify all **35 preexisting packaging files / 13 raw capture
+hashes / 20 original files / 23 v2 files / 18 failed-guard files**, the **158-file
+original / 233-file v2 fixtures** and current v3-fixed synthetic fixture unchanged.
+
+Exact command/log/result records are in ignored
+`research/starlte/ufs-probe-3-bringup/`:
+`ci-41014066730-finalization-command.json`, `ci-41014066730-finalization.log`,
+`ci-41014066730-finalization-result.json`, `ci-41014066730-delivery-final.json`,
+and `ci-41014066730-delivery-independent-{command,result,review}.json` plus
+`ci-41014066730-delivery-independent.log`. The independent delivery auditor is
+pinned to **`5c3bab78b510ce73dfb825d8ba4ee13a55393645de5062678b00f276af7db04d`**;
+its actual report/log SHA256 is
+**`47471b8df0781f6a87e75c0937527d727dbab0514c68c83109a0c80b734c345d`**.
+**Do not rerun** any completed CI/download/packaging/capture/audit/guard/fixture
+or finalizer path, or edit the frozen delivery/archive.
+
+Use the already selected **TWRP / OrangeFox** test-image route; no extra recovery
+check or phone-flashing/formatting command is supplied. Photograph the **whole
+screen**, including both **first-error / terminal** live samples: **IS/HCE/HCS**,
+**UIC PA/DL/NL/TL/DME**, **list/DBR/RSR/TM**, **UTRD0-7/OCS**, **RESP0-15**,
+the failure/write counters and **PROBE HOLD**. Include earlier HCE/FMP/read lines
+if visible; if it stalls earlier, capture the last line. Commands stay read-only
+even with `ufsrw=1`; the bounded wait/clear, permanent quarantine and pre-BSD/root
+hold remain. Preserve recovery, bootloaders, modem, persist and partition backups;
+do not put this boot image in userdata or other non-boot partitions.
+
+The agent performed **no phone operations**. Samsung descriptor/data-DMA
+acceptance, media capacity/GPT and repeated userdata reads remain unverified.
+No Apple root was downloaded or built, and no root mount/userspace proof exists.
+Root preparation follows measured Samsung reads; any destructive operation on
+the existing userdata partition needs separate confirmation, with no GPT changes.
 
 ## Getting-started guide review for S9
 
@@ -1110,14 +1181,15 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Diagnose the photographed first-command
-   UIC timeout with a bounded pre-cleanup diagnostic probe. Obtain actual LUN
+1. **Read-only Samsung storage.** Test the completed
+   [probe-3 delivery](#ufs-probe-3-software-delivery) and photograph both pre-cleanup
+   samples to diagnose probe 2's first-command UIC timeout. Obtain actual LUN
    capacity/GPT and repeated userdata reads
    before preparing the iOS26 root. A userdata write needs explicit confirmation.
 2. **Complete the physical XNU record.** Probe 2 establishes HCE enable and
    the FMP return, followed by a first-command UIC timeout and failure hold.
-   Capture whole-screen results of subsequent tests, including the last visible
-   line if enable or storage discovery stalls.
+   Capture probe 3's whole-screen first-error/terminal UIC/list/UTRD/response
+   samples, counters and PROBE HOLD, or the last visible line if it stalls earlier.
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
    observed zero `CNTFRQ_EL0` register.
