@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -102,6 +103,7 @@ static uint32_t model_rd(uint32_t, bool);
 static void model_wr(uint32_t, uint32_t, bool);
 static uint64_t model_smc(void);
 static void model_barrier(void);
+static int model_printf(const char *, ...);
 static void sweet_dma_sync_va(const void *, uint32_t);
 static void flush_dcache64(addr64_t, uint32_t, int);
 static void clean_dcache64(addr64_t, uint32_t, int);
@@ -150,7 +152,9 @@ SERVICE(sweet_cpufreq_max)
 SERVICE(sweet_charger_start)
 SERVICE(sweet_a630_probe)
 
+#define printf model_printf
 #include "ufs-production.inc"
+#undef printf
 
 /* Deliberately independent of struct utrd/ucd and their layout constants. */
 #define MODEL_WINDOW 0x204000u
@@ -172,6 +176,7 @@ struct disk {
 enum fault {
 	OK, TIMEOUT, BAD_OCS, BAD_TYPE, BAD_LUN, BAD_TAG, BAD_RESPONSE, HOST_ERROR,
 	RESIDUAL, UNDERFLOW, OVERFLOW, SENSE, BUSY, FULL, MISSING_DATA, CHANGED_DATA,
+	PENDING_ERROR, COMPLETE_ERROR,
 };
 struct model {
 	bool exynos, unknown_board, node_present, chosen_present;
@@ -180,13 +185,18 @@ struct model {
 	bool stop_readiness_loss, stop_host_error, hce_pending, hce_stuck;
 	bool prdt_stuck, nexus_stuck, fail_hci_map, fail_vendor_map, fail_pool_map;
 	bool fail_alloc, fail_verify_alloc, expect_hold, waiting_hold;
+	bool pending_live, error_sent, uic_read_clear, drop_error_is, complete_on_uic;
+	bool corrupt_on_clear, corrupt_on_ack;
 	uint64_t smc_result, now, wake, pa, allocation_pa;
 	uint64_t hce_start, hce_latency, hce_completed;
+	uint64_t command_start, error_delay, complete_delay;
 	uint32_t hce_hcs, hce_is, hce_dbr, hce_tm_dbr, hce_rsr, hce_tm_rsr;
+	uint32_t fault_is, fault_uic[5];
 	uint32_t r[128], v[128], size, clear_value, visits;
 	unsigned mmio_reads, mmio_writes, vendor_writes, commands, writes, syncs;
 	unsigned base_writes, allocations, maps, smcs, barriers, cache_ops, sleeps;
 	unsigned hce_enables, hce_echo_reads, hce_init_reads;
+	unsigned uic_reads[5], clears, command_acks;
 	unsigned bdevs, cdevs, nodes, last_prds, last_len, last_op;
 	unsigned opcount[256], fault_left, fault_skip;
 	int fault_op;
@@ -201,10 +211,24 @@ struct model {
 	struct { const char *name; uint32_t value; } args[16];
 	unsigned nargs;
 	char rootname[65];
+	char console[131072];
+	size_t console_size;
 } m;
 static uint8_t fixture_data[2][4096 + 8192 + 4096];
 static uint8_t wire[1u << 20];
 static jmp_buf hold;
+
+static int model_printf(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	int n = vsnprintf(m.console + m.console_size, sizeof(m.console) - m.console_size, format, args);
+	va_end(args);
+	CHECK(n >= 0 && (size_t)n < sizeof(m.console) - m.console_size);
+	fwrite(m.console + m.console_size, 1, n, stdout);
+	m.console_size += n;
+	return n;
+}
 
 static uint16_t le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
 static uint32_t le32(const uint8_t *p) { return le16(p) | (uint32_t)le16(p + 2) << 16; }
@@ -299,6 +323,9 @@ static void reset_model(bool exynos, unsigned block)
 	m.exynos = exynos;
 	m.node_present = m.chosen_present = true;
 	m.fault_op = -1;
+	m.fault_is = 4;
+	static const uint32_t uic[] = { 0x80000001, 0x80000002, 0x80000004, 0x80000040, 0x80000001 };
+	memcpy(m.fault_uic, uic, sizeof(uic));
 	m.allocation_pa = exynos ? 0x81100000ull : 0xb2000000ull;
 	CHECK(posix_memalign((void **)&m.allocation, 0x4000, MODEL_WINDOW + 0x8000) == 0);
 	memset(m.allocation, 0xa7, MODEL_WINDOW + 0x8000);
@@ -418,9 +445,11 @@ static void model_command(void)
 		if (m.fault_skip) { m.fault_skip--; }
 		else { fault = m.fault; m.fault_left--; }
 	}
-	if (fault == TIMEOUT) {
+	if (fault == TIMEOUT || fault == PENDING_ERROR) {
 		m.pending_pa = entries ? spans[0].pa : cmd_pa + resp_offset;
 		m.pending_len = entries ? spans[0].len : 32;
+		m.command_start = m.now;
+		m.pending_live = fault == PENDING_ERROR;
 		return;
 	}
 	memset(resp, 0, 52);
@@ -492,6 +521,11 @@ static void model_command(void)
 	case BAD_TAG: resp[3] ^= 1; break;
 	case BAD_RESPONSE: resp[6] = 1; break;
 	case HOST_ERROR: m.r[0x20 / 4] |= 0x10000; break;
+	case COMPLETE_ERROR:
+		m.r[0x20 / 4] |= m.fault_is;
+		for (unsigned i = 0; i < 5; i++) { m.r[(0x38 / 4) + i] = m.fault_uic[i]; }
+		put_le32(t + 8, 0x1a000000); /* raw reserved bits retained, OCS success is not enough */
+		break;
 	case RESIDUAL: put_net32(resp + 12, 4); break;
 	case UNDERFLOW: resp[1] = 0x20; break;
 	case OVERFLOW: resp[1] = 0x40; break;
@@ -519,6 +553,33 @@ static void model_enable_progress(void)
 	m.hce_completed = m.now;
 }
 
+static void model_pending_complete(void)
+{
+	uint8_t *resp = m.dma + 0x1200;
+	memset(resp, 0, 16);
+	resp[0] = 0x21;
+	put_le32(m.dma + 8, 0);
+	m.r[0x58 / 4] = 0;
+	m.r[0x20 / 4] |= 1;
+	m.pending_live = false;
+}
+
+static void model_command_progress(void)
+{
+	if (!m.pending_live) { return; }
+	uint64_t elapsed = m.now - m.command_start;
+	if (!m.error_sent && elapsed >= m.error_delay) {
+		m.error_sent = true;
+		m.r[0x20 / 4] |= m.fault_is;
+		for (unsigned i = 0; i < 5; i++) { m.r[(0x38 / 4) + i] = m.fault_uic[i]; }
+		/* Deliberately partial/inconsistent live DMA, not a completed response. */
+		put_le32(m.dma + 8, 0x1a00000f);
+		static const uint8_t response[16] = { 0x21, 0x40, 7, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+		memcpy(m.dma + 0x1200, response, sizeof(response));
+	}
+	if (m.complete_delay && elapsed >= m.complete_delay) { model_pending_complete(); }
+}
+
 static uint32_t model_rd(uint32_t off, bool vendor)
 {
 	CHECK((vendor ? m.vendor_mapped : m.hci_mapped) && off < 0x200 && !(off & 3));
@@ -528,7 +589,28 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 		else { m.hce_init_reads++; }
 	}
 	model_enable_progress();
-	return (vendor ? m.v : m.r)[off / 4];
+	model_command_progress();
+	uint32_t value = (vendor ? m.v : m.r)[off / 4];
+	if (!vendor && off >= 0x38 && off <= 0x48) {
+		CHECK(m.exynos && m.commands); /* Qualcomm and successful setup do not sample UIC codes. */
+		m.uic_reads[(off - 0x38) / 4]++;
+		if (m.uic_read_clear) { m.r[off / 4] = 0; }
+		if (off == 0x48 && m.complete_on_uic && m.pending_live) { model_pending_complete(); }
+	}
+	if (!vendor && off == 0x20 && m.drop_error_is && m.commands) {
+		m.r[off / 4] &= ~m.fault_is;
+	}
+	return value;
+}
+
+static void model_cleanup_corruption(void)
+{
+	for (unsigned i = 0; i < 5; i++) {
+		CHECK(m.uic_reads[i]); /* Required observations precede either cleanup write. */
+		m.r[(0x38 / 4) + i] = 0;
+	}
+	memset(m.dma, 0x5a, 32);
+	memset(m.dma + 0x1200, 0xa5, 16);
 }
 
 static void model_wr(uint32_t off, uint32_t value, bool vendor)
@@ -555,8 +637,17 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 		m.r[off / 4] = 1; /* controller's immediate echo must not pass the enable wait */
 		return;
 	}
-	if (off == 0x20) { m.r[off / 4] &= ~value; return; }
+	if (off == 0x20) {
+		if (m.commands) {
+			m.command_acks++;
+			if (m.corrupt_on_ack) { model_cleanup_corruption(); }
+		}
+		m.r[off / 4] &= ~value;
+		return;
+	}
 	if (off == 0x5c) {
+		m.clears++;
+		if (m.corrupt_on_clear) { model_cleanup_corruption(); }
 		m.clear_value = value;
 		CHECK(value == (m.exynos ? 1u : ~1u));
 		if (!m.sticky_dbr) { m.r[0x58 / 4] = 0; }
@@ -966,6 +1057,200 @@ static void test_failures(void)
 	passed(case_name);
 }
 
+static unsigned occurrences(const char *needle)
+{
+	unsigned count = 0;
+	for (const char *p = m.console; (p = strstr(p, needle)); p += strlen(needle)) { count++; }
+	return count;
+}
+
+static void diagnostic_samples(unsigned count)
+{
+	CHECK(count <= 2 && occurrences("(live sample)") == count);
+	CHECK(occurrences("STARLTE UFS: UIC PA ") == count);
+	CHECK(occurrences("STARLTE UFS: UTRD0-3 LE ") == count);
+	CHECK(occurrences("STARLTE UFS: UTRD4-7 LE ") == count);
+	CHECK(occurrences("STARLTE UFS: RESP0-15 BE ") == count);
+	for (unsigned i = 0; i < 5; i++) { CHECK(m.uic_reads[i] == count); }
+}
+
+static void diagnostic_quarantine(void)
+{
+	CHECK(su.dead && m.commands == 1 && !m.writes && !ss.retries && ss.cmd_failures == 1);
+	unsigned accesses = m.mmio_reads + m.mmio_writes;
+	uint32_t digest = crc32(0, m.dma, m.size);
+	uint8_t tur[6] = { 0 };
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && m.commands == 1);
+	CHECK(crc32(0, m.dma, m.size) == digest);
+}
+
+static void test_diagnostics(void)
+{
+	uint8_t tur[6] = { 0 };
+	static const char *codes = "UIC PA 80000001 DL 80000002 NL 80000004 TL 80000040 DME 80000001";
+	static const char *empty = "UIC PA 00000000 DL 00000000 NL 00000000 TL 00000000 DME 00000000";
+	static const unsigned error_bits[] = { 2, 7, 11, 12, 16, 17, 18 };
+
+	case_name = "healthy immediate completion has no diagnostic reads";
+	transport(true, 4096);
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == 0);
+	diagnostic_samples(0);
+	passed(case_name);
+
+	case_name = "healthy delayed completion has no diagnostic reads";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+	m.fault_is = 0; m.complete_delay = 8000000;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == 0 && !su.dead);
+	diagnostic_samples(0);
+	passed(case_name);
+
+	for (unsigned sticky = 0; sticky < 2; sticky++) {
+		case_name = "timeout snapshot precedes successful or stuck request clear";
+		transport(true, 4096); inject(TIMEOUT, 1, 0);
+		m.sticky_dbr = sticky; m.corrupt_on_clear = true;
+		CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == ETIMEDOUT);
+		diagnostic_samples(1);
+		CHECK(!occurrences("first-error") && occurrences("timeout-preclear") == 1);
+		CHECK(occurrences("DBR 1->1 RSR 1 TM 0/0") == 1);
+		CHECK(occurrences("UTRD0-3 LE 11000000 00000000 0000000f 00000000 (OCS 0f)") == 1);
+		CHECK(occurrences("UTRD4-7 LE 81101000 00000000 02000200 04000000") == 1);
+		CHECK(occurrences("RESP0-15 BE 00000000 00000000 00000000 00000000") == 1);
+		CHECK(occurrences(empty) == 1 && !ss.is_errors && ss.timeouts == 1);
+		CHECK(m.clears == 1 && m.command_acks == 1 && m.clear_value == 1);
+		CHECK(m.r[0x58 / 4] == sticky && le32(m.dma + 8) == 0x5a5a5a5a);
+		diagnostic_quarantine();
+		passed(case_name);
+	}
+
+	for (unsigned i = 0; i < sizeof(error_bits) / sizeof(error_bits[0]); i++) {
+		case_name = "first pending error preserved across read-clear registers and timeout cleanup";
+		transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+		m.fault_is = 1u << error_bits[i];
+		m.uic_read_clear = m.drop_error_is = m.corrupt_on_clear = true;
+		CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == ETIMEDOUT);
+		diagnostic_samples(2);
+		CHECK(occurrences("first-error") == 1 && occurrences("timeout-preclear") == 1);
+		CHECK(occurrences(codes) == 1 && occurrences(empty) == 1);
+		CHECK(occurrences("UTRD0-3 LE 11000000 00000000 1a00000f 00000000 (OCS 0f)") == 2);
+		CHECK(occurrences("RESP0-15 BE 21400703 04050607 08090a0b 0c0d0e0f") == 2);
+		CHECK(ss.last_is == m.fault_is && ss.is_errors == 1 && ss.timeouts == 1);
+		CHECK(m.clears == 1 && m.command_acks == 1 && !m.r[0x20 / 4]);
+		diagnostic_quarantine();
+		passed(case_name);
+	}
+
+	for (unsigned i = 0; i < sizeof(error_bits) / sizeof(error_bits[0]); i++) {
+		case_name = "completed error snapshot precedes interrupt acknowledgement and DMA mutation";
+		transport(true, 4096); inject(COMPLETE_ERROR, 1, 0);
+		m.fault_is = 1u << error_bits[i]; m.corrupt_on_ack = true;
+		CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+		diagnostic_samples(1);
+		CHECK(!occurrences("first-error") && occurrences("complete-preack") == 1);
+		CHECK(occurrences(codes) == 1 && occurrences("DBR 0->0 RSR 1 TM 0/0") == 1);
+		CHECK(occurrences("UTRD0-3 LE 11000000 00000000 1a000000 00000000 (OCS 00)") == 1);
+		CHECK(occurrences("RESP0-15 BE 21000000 00000000 00000000 00000000") == 1);
+		CHECK(!ss.timeouts && ss.is_errors == 1 && !m.clears && m.command_acks == 1);
+		diagnostic_quarantine();
+		passed(case_name);
+	}
+
+	case_name = "earlier error cannot be hidden by an apparently good later completion";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+	m.uic_read_clear = m.drop_error_is = true; m.complete_delay = 8000000;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+	diagnostic_samples(2);
+	CHECK(occurrences("first-error") == 1 && occurrences("complete-preack") == 1);
+	CHECK(occurrences("RESP0-15 BE 21400703 04050607 08090a0b 0c0d0e0f") == 1);
+	CHECK(occurrences("RESP0-15 BE 21000000 00000000 00000000 00000000") == 1);
+	CHECK(occurrences(codes) == 1 && occurrences(empty) == 1);
+	CHECK(ss.last_is == 5 && !ss.timeouts && !m.clears);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "error arriving at the deadline retained by terminal preclear sample";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+	/* The model's first time read sets the deadline 1 ms after submission.
+	 * Inject just after that deadline, not after the next full 1 ms tick.
+	 */
+	m.error_delay = 5001000001ull; m.drop_error_is = m.corrupt_on_clear = true;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == ETIMEDOUT);
+	diagnostic_samples(1);
+	CHECK(!occurrences("first-error") && occurrences("timeout-preclear") == 1);
+	CHECK(occurrences(codes) == 1 && ss.last_is == 4 && ss.is_errors == 1);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "doorbell completion during a live sample is reported as a race";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+	m.complete_on_uic = m.drop_error_is = true;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+	diagnostic_samples(2);
+	CHECK(occurrences("DBR 1->0 RSR 1 TM 0/0") == 1);
+	CHECK(occurrences("DBR 0->0 RSR 1 TM 0/0") == 1);
+	CHECK(!ss.timeouts && !m.clears);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "sleepable timeout retains bounded two-sample diagnostics and quarantine";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0);
+	su.wait = su.ready = true; m.sticky_dbr = true;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == ETIMEDOUT && m.sleeps);
+	diagnostic_samples(2);
+	CHECK(m.now - m.command_start <= 5104000000ull && m.clears == 1);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "raw layer values retain unknown and invalid bits without guessed recovery";
+	transport(true, 4096); inject(COMPLETE_ERROR, 1, 0);
+	static const uint32_t raw[] = { 0xdeadbeef, 0x76543210, 0, 0xffffffff, 0x12345678 };
+	memcpy(m.fault_uic, raw, sizeof(raw));
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+	diagnostic_samples(1);
+	CHECK(occurrences("UIC PA deadbeef DL 76543210 NL 00000000 TL ffffffff DME 12345678") == 1);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "nonerror pending interrupt is not classified as a first transport error";
+	transport(true, 4096); inject(PENDING_ERROR, 1, 0); m.fault_is = 1u << 10;
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == ETIMEDOUT);
+	diagnostic_samples(1);
+	CHECK(!occurrences("first-error") && !ss.is_errors);
+	diagnostic_quarantine();
+	passed(case_name);
+
+	case_name = "photographed TUR failure diagnostics hold before registration and quarantine DMA";
+	reset_model(true, 4096); inject(PENDING_ERROR, 1, 0);
+	arg("ufsprobe", 1); arg("ufsrw", 1); m.expect_hold = true;
+	if (!setjmp(hold)) { dev_t dev; (void)sweet_ufs_rootdev(&dev); CHECK(false); }
+	diagnostic_samples(2);
+	CHECK(occurrences("(transport quarantined)") == 1 && occurrences("PROBE HOLD") == 1);
+	CHECK(occurrences("writes 0, commands failed 1") == 1 && !su.writable && !su.ready);
+	CHECK(!m.bdevs && !m.cdevs && !m.nodes && !services && !sweet_ufs_lock);
+	diagnostic_quarantine();
+	unsigned accesses = m.mmio_reads + m.mmio_writes;
+	memset(dma_at(m.pending_pa, m.pending_len), 0x39, m.pending_len); /* late DMA after clear */
+	uint32_t digest = crc32(0, m.dma, m.size);
+	dev_t dev = 0;
+	/* The test-owned longjmp exits the nonreturning hold before init_error
+	 * can be assigned by the caller. The su.dead guard still prevents reuse.
+	 */
+	CHECK(sweet_ufs_rootdev(&dev) == EIO && !dev);
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && crc32(0, m.dma, m.size) == digest);
+	passed(case_name);
+
+	case_name = "first-command UIC timeout is cached when probe hold is disabled";
+	reset_model(true, 4096); inject(PENDING_ERROR, 1, 0);
+	CHECK(sweet_ufs_rootdev(&dev) == ETIMEDOUT && su.init_error == ETIMEDOUT);
+	diagnostic_samples(2);
+	accesses = m.mmio_reads + m.mmio_writes;
+	digest = crc32(0, m.dma, m.size);
+	CHECK(sweet_ufs_rootdev(&dev) == ETIMEDOUT && !dev);
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && crc32(0, m.dma, m.size) == digest);
+	CHECK(!m.bdevs && !m.writes && !ss.retries && m.commands == 1);
+	passed(case_name);
+}
+
 static void test_capacity(void)
 {
 	static const uint32_t sizes[] = { 512, 1024, 2048, 4096, 0, 256, 513, 8192 };
@@ -1286,6 +1571,7 @@ int main(int argc, char **argv)
 	test_enable();
 	test_takeover();
 	test_failures();
+	test_diagnostics();
 	test_capacity();
 	test_gpt();
 	test_handoff();

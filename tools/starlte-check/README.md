@@ -27,7 +27,7 @@ The recorded environment is Linux/x86_64, Clang **23.1.3** and QEMU
   headers/library for `ufs.py` (`-lz`).
 
 The XNU checks need a **fully staged and patched** `xnu-12377.121.6` tree,
-including patches 1131 and 1132. Default: `research/starlte/xnu`.
+including patches 1131–1134. Default: `research/starlte/xnu`.
 Preparation follows [`xnu.yml`](../../.github/workflows/xnu.yml) /
 [`tools/xnu-local-build.sh`](../xnu-local-build.sh):
 
@@ -208,7 +208,7 @@ device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**135 host scenarios** exercise:
+**161 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
@@ -221,6 +221,13 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 * Read-only opcode enforcement even with `ufsrw=1`, timeout-clear polarity,
   late-DMA quarantine, initialization-failure caching, response validation,
   partial-transfer rejection and bounded transient retries.
+* First-error and terminal pre-cleanup diagnostics: all seven error bits,
+  read-clear layer registers, cleanup-mutated DMA, immediate/delayed completion,
+  deadline and doorbell races, raw unknown codes, bounded two-sample output,
+  sleepable waits and the photographed TUR failure hold. A later good-looking
+  completion cannot hide a previously observed transport error. Samples read
+  only the fixed owned UTRD and response header, never media or hardware-provided
+  addresses; neither sample validates completion nor adds link recovery.
 * Capacity/block-size validation, READ CAPACITY(16), READ(16) beyond 32-bit
   LBAs, LUNs 0–7, mixed geometries, strict GPT CRC/geometry/partition bounds,
   exact case-insensitive names and mismatched or missing repeated reads.
@@ -237,7 +244,9 @@ trees and unchanged input/guard bytes on rejection.
 
 These are software protocol/ownership checks. They do not establish Samsung
 clock/PHY/link state, secure-firmware acceptance, cache/interconnect behavior,
-real DMA access or readable media. The new kernel/image needs a device probe.
+real DMA access or readable media. Probe 2 physically enabled HCE and observed
+the FMP format call returning zero, but its first TEST UNIT READY timed out with
+UIC_ERROR. The new diagnostic kernel/image still needs a device probe.
 
 ### Reset and final framebuffer: `reset.py`
 

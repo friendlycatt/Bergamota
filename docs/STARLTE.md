@@ -21,8 +21,9 @@ touch, Mali GPU, USB and power-management support remain follow-up work.
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The platform and storage work is in
 [`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch),
-[`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch)
-and [`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch),
+[`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch),
+[`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch)
+and [`1134-starlte-ufs-precleanup-diagnostics.patch`](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -315,8 +316,8 @@ translation support.
 | Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| UFS (`ufs.py`) | PASS, 135 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
-| Ordered patch reconstruction | PASS: local four-stage / 276-patch reconstruction, 6369 files and baseline hashes exact; reviewed CI profile adds six dxb substitutions and real KDK staging, 6374 files exact; two documented dxb skips |
+| UFS (`ufs.py`) | PASS, 161 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
+| Ordered patch reconstruction | PASS: local four-stage / 277-patch reconstruction, 6369 files and baseline hashes exact; prior probe-2 CI profile (276 patches) reconstructs 6374 files with six dxb substitutions and real KDK staging; two documented dxb skips |
 | Full XNU26 CI build | PASS, run 40955206538; actual ARM64 Mach-O, checksum, HCE markers and patches 1131–1133 verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
@@ -902,6 +903,49 @@ fresh `research/starlte/ufs-probe-3-bringup/`: seven source/documentation copies
 351 prior source hashes and **498 protected artifacts**. At this observation
 milestone, no probe-3 driver patch, CI run or image has been produced.
 
+### Probe-3 pre-cleanup diagnostics
+
+Additive [patch 1134](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch)
+retains the inherited-host enable/read-only transport and adds bounded evidence:
+
+* Save the **first observed pending interrupt error**, then the **terminal
+  timeout or error-completion state** before request clear or IS acknowledgement.
+* Print raw **PA/DL/NL/TL/DME**, HCE/HCS/IS, transfer/task list state and base,
+  all **eight UTRD words** (including OCS) and the first **16 response-header
+  bytes**. Observe DBR before and after each sample to expose completion races.
+* Use volatile reads of the fixed owned Normal-NC descriptor arena and barriers;
+  do not clean/write pending DMA, chase hardware descriptor pointers or dump media.
+  These are explicitly **non-atomic live samples**, not completed-response proof.
+* At most **two six-line samples** are emitted for a failed transport. Keep the
+  existing five-second wait and bounded clear, permanent Exynos DMA quarantine,
+  cached failures, read-only allowlist and pre-registration probe hold. No PHY,
+  reset or UIC command write is added. Earlier observed errors remain fatal even
+  if subsequent status/response fields look successful.
+
+`ufs.py --out research/starlte/ufs-probe-3-check-final` exits **0**: **161 host
+scenarios**, **24 ADT cases**, fatal ASan/UBSan and complete real-header Mach-O
+compilation. The **26 added cases** check read-clear UIC registers, DMA mutation
+by cleanup, all seven error bits, pending/completed/no-error paths, deadline and
+DBR races, unknown raw bits, bounded output, sleepable waits, failure caching,
+late-DMA quarantine and the photographed TUR failure hold. The unchanged host
+service boundary does not model Samsung clocks/link/firmware or physical DMA.
+
+Two initial **fixture** failures are preserved: a deadline injection was one
+model tick too late, and a synthetic `longjmp` from the nonreturning hold bypassed
+the caller's cached-errno assignment. Corrected expectations pass without driver
+changes. The first forward-export fixture also lacked its own git repository
+and skipped paths; the fresh isolated fixture now verifies exact final bytes.
+
+Driver SHA256 **`06029905a8bf3f7ed0126d1728f534b20f2af2c8d9386237abdcf9dd7924e7d8`**;
+patch **6088 bytes**, SHA256
+**`ddf2dff41396c6a233a4bf591cca17c32c3ea3224001782ef4dbbeeb712766de`**.
+Exact GNU export, forward/reverse application and **498 protected-artifact
+hashes** pass. Fresh `verify-series.py --out research/starlte/series-check-ufs-probe-3`
+exits **0**: **four staging scripts / 277 patches / 6369 source files exact**,
+including the 14 pre-1131 and one pre-1132 baseline hashes; only the two documented
+dxb skips. The next CI/image remains pending at this local-validation milestone;
+the current phone result remains probe 2's timeout.
+
 ## Getting-started guide review for S9
 
 The pasted guide describes Poco F1 / Qualcomm and older iOS18 defaults.
@@ -910,7 +954,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1133, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1134, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |

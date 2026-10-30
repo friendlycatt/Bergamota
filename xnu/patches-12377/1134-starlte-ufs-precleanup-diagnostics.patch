@@ -1,0 +1,163 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -93,6 +93,11 @@
+ #define REG_IE          0x24
+ #define REG_HCS         0x30
+ #define REG_HCE         0x34
++#define REG_UECPA       0x38
++#define REG_UECDL       0x3c
++#define REG_UECN        0x40
++#define REG_UECT        0x44
++#define REG_UECDME      0x48
+ #define REG_UTRLBA      0x50
+ #define REG_UTRLBAU     0x54
+ #define REG_UTRLDBR     0x58
+@@ -303,6 +308,69 @@
+ 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+ }
+ 
++/* Samsung ufshci.h/ufshcd_update_uic_error: IS.UIC_ERROR alone cannot
++ * distinguish PA/DL/NL/TL/DME failures. Save the first observed error and
++ * terminal state before UTRLCLR/IS acknowledgement can obscure the evidence.
++ * These are bounded, non-atomic live samples, never completion validation.
++ */
++struct exynos_ufs_sample {
++	uint32_t is, hce, hcs, dbr, dbr_after, rsr, tm_dbr, tm_rsr, base, baseu;
++	uint32_t uic[5], trd[8];
++	uint8_t response[16];
++};
++
++static void
++exynos_ufs_capture(struct exynos_ufs_sample *s, uint32_t is)
++{
++	s->is = is;
++	s->hce = ufs_rd(REG_HCE);
++	s->hcs = ufs_rd(REG_HCS);
++	s->dbr = ufs_rd(REG_UTRLDBR);
++	s->rsr = ufs_rd(REG_UTRLRSR);
++	s->tm_dbr = ufs_rd(REG_UTMRLDBR);
++	s->tm_rsr = ufs_rd(REG_UTMRLRSR);
++	s->base = ufs_rd(REG_UTRLBA);
++	s->baseu = ufs_rd(REG_UTRLBAU);
++	s->uic[0] = ufs_rd(REG_UECPA);
++	s->uic[1] = ufs_rd(REG_UECDL);
++	s->uic[2] = ufs_rd(REG_UECN);
++	s->uic[3] = ufs_rd(REG_UECT);
++	s->uic[4] = ufs_rd(REG_UECDME);
++	/* Exynos owns a Normal-NC arena. Do not clean/write controller-owned
++	 * memory, chase descriptor addresses, or inspect the media buffer.
++	 * Volatile loads retain actual observations even while DMA is pending.
++	 */
++	const volatile uint32_t *trd = (const volatile uint32_t *)(su.dma + DMA_UTRL);
++	const volatile uint8_t *resp = (const volatile uint8_t *)(su.dma + DMA_UCD +
++	    offsetof(struct ucd, resp));
++	__builtin_arm_dsb(0xf);
++	for (unsigned i = 0; i < 8; i++) {
++		s->trd[i] = trd[i];
++	}
++	for (unsigned i = 0; i < sizeof(s->response); i++) {
++		s->response[i] = resp[i];
++	}
++	__builtin_arm_dsb(0xf);
++	s->dbr_after = ufs_rd(REG_UTRLDBR);
++}
++
++static void
++exynos_ufs_log_sample(const struct exynos_ufs_sample *s, const char *phase, uint8_t op)
++{
++	printf("STARLTE UFS: %s cmd %02x lun %u IS %08x HCE %x HCS %x (live sample)\n",
++	    phase, op, su.lun, s->is, s->hce, s->hcs);
++	printf("STARLTE UFS: UIC PA %08x DL %08x NL %08x TL %08x DME %08x\n",
++	    s->uic[0], s->uic[1], s->uic[2], s->uic[3], s->uic[4]);
++	printf("STARLTE UFS: list %08x:%08x DBR %x->%x RSR %x TM %x/%x\n",
++	    s->baseu, s->base, s->dbr, s->dbr_after, s->rsr, s->tm_dbr, s->tm_rsr);
++	printf("STARLTE UFS: UTRD0-3 LE %08x %08x %08x %08x (OCS %02x)\n",
++	    s->trd[0], s->trd[1], s->trd[2], s->trd[3], s->trd[2] & 0xff);
++	printf("STARLTE UFS: UTRD4-7 LE %08x %08x %08x %08x\n",
++	    s->trd[4], s->trd[5], s->trd[6], s->trd[7]);
++	printf("STARLTE UFS: RESP0-15 BE %08x %08x %08x %08x\n",
++	    be32(s->response), be32(s->response + 4), be32(s->response + 8), be32(s->response + 12));
++}
++
+ /*
+  * One attempt of one SCSI command in slot 0, data (if any) to/from the DMA window at data_off
+  * (to the device when write is set). Returns 0 or an errno; *retry says whether repeating the
+@@ -406,14 +474,29 @@
+ 	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+ 	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+ 	uint64_t spin_until = 0, sleep_interval = 0;
++	struct exynos_ufs_sample first_error;
++	uint32_t first_is = 0;
+ 	if (sleepable) {
+ 		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (su.exynos && !first_is) {
++			uint32_t pending_is = ufs_rd(REG_IS);
++			if (pending_is & UFS_IS_ERR_MASK) {
++				exynos_ufs_capture(&first_error, pending_is);
++				first_is = pending_is;
++			}
++		}
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			struct exynos_ufs_sample terminal;
++			uint32_t before_is = 0;
++			if (su.exynos) {
++				exynos_ufs_capture(&terminal, ufs_rd(REG_IS));
++				before_is = terminal.is | first_is;
++			}
+ 			ufs_wr(REG_UTRLCLR, su.exynos ? 1u : ~1u);
+ 			/*
+ 			 * The host retires the slot on its own, but the device may still own the data
+@@ -429,12 +512,18 @@
+ 			ss.cmd_failures++;
+ 			ss.last_cdb = cdb[0];
+ 			ss.last_ocs = 0xff;
+-			ss.last_is = is;
++			ss.last_is = is | before_is;
+ 			ss.last_hcs = ufs_rd(REG_HCS);
+-			if (is & UFS_IS_ERR_MASK) {
++			if (ss.last_is & UFS_IS_ERR_MASK) {
+ 				ss.is_errors++;
+ 			}
+-			printf("SWEET UFS: command 0x%02x timed out (is 0x%x hcs 0x%x dbr 0x%x)\n",
++			if (su.exynos) {
++				if (first_is) {
++					exynos_ufs_log_sample(&first_error, "first-error", cdb[0]);
++				}
++				exynos_ufs_log_sample(&terminal, "timeout-preclear", cdb[0]);
++			}
++			printf("SWEET UFS: command 0x%02x timed out (post-clear is 0x%x hcs 0x%x dbr 0x%x)\n",
+ 			    cdb[0], is, ss.last_hcs, ufs_rd(REG_UTRLDBR));
+ 			/* Never reuse Exynos DMA after a timeout, even if DBR clears.
+ 			 * The arena stays reserved for the remainder of this boot.
+@@ -456,7 +545,16 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	uint32_t is = ufs_rd(REG_IS);
++	if (su.exynos && ((is | first_is) & UFS_IS_ERR_MASK)) {
++		struct exynos_ufs_sample terminal;
++		exynos_ufs_capture(&terminal, is);
++		if (first_is) {
++			exynos_ufs_log_sample(&first_error, "first-error", cdb[0]);
++		}
++		exynos_ufs_log_sample(&terminal, "complete-preack", cdb[0]);
++	}
+ 	ufs_wr(REG_IS, is);                     /* acknowledge completion status */
++	is |= first_is;                         /* sampling must not hide an earlier error */
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -895,7 +993,7 @@
+ 			return 0;
+ 		}
+ 		printf("STARLTE UFS: LUN %u scan result %d%s\n", su.lun, error,
+-		    su.dead ? " (host stopped)" : "");
++		    su.dead ? " (transport quarantined)" : "");
+ 		last_error = error;
+ 	}
+ 	return last_error;
