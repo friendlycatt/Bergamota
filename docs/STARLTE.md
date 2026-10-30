@@ -17,8 +17,11 @@ Local checks pass **527 host / 24 ADT / fatal sanitizers / real-header compile**
 fresh reconstruction passes **281 patches / 6369 files**, including the complete
 pre-1138 baseline. Source **db22b20** is committed/pushed and Intel CI
 **[41134708958](https://github.com/friendlycatt/Bergamota/actions/runs/41134708958)**
-is dispatched. Build result, replacement image and physical capacity/GPT/reads
-remain pending.
+**succeeded**, attempt 1, job **124334184763**, complete **22:34:30Z**. Fresh
+delivery inputs and all **6374 expected source hashes** are pinned before download,
+inventory **`8180b06464093bf5ccb9946191c4153eed613043c043fb480d5dbb1372ac0248`**.
+Artifact inspection and replacement packaging are underway; physical
+capacity/GPT/reads remain pending.
 
 **Previous failure, 2026-10-30:** the [startup-candidate photograph](#photographed-startup-candidate-result)
 stops **before HCE enable**, with **IS=0 / HCE=0 / HCS=0x10f / idle DBRs /
