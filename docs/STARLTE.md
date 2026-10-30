@@ -23,8 +23,11 @@ independently raw-audited and finalized. The corrected QEMU audit verifies the
 expected missing-node hold. Its physical result exposes an overly strict
 startup guard; the [narrowly gated clearing correction](#narrow-pre-hce-linereset-correction)
 in additive patch **1137** passes **501 host / 24 ADT / fatal sanitizers /
-real-header compilation / 280-patch / 6369-file reconstruction**. Commit/push
-and a replacement CI image remain next; UIC/NOP/TUR stay strict.
+real-header compilation / 280-patch / 6369-file reconstruction**. Source
+**e1458e3** is pushed; [Intel CI 41122349335](https://github.com/friendlycatt/Bergamota/actions/runs/41122349335)
+was queued at dispatch. Replacement delivery inputs and all 6374 expected CI
+source hashes are pinned; the new kernel/image remains pending.
+UIC/NOP/TUR stay strict.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
 **Samsung media reads and an iOS root mount
@@ -342,7 +345,7 @@ translation support.
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
 | UFS (`ufs.py`) | PASS, 501 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing and deferred boundary output |
 | Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; frozen startup CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
-| Full XNU26 CI build | PASS, run 41092452347 / ec7a619; actual ARM64 Mach-O, checksum, startup/NOP markers and patches 1131–1136 verified; patch 1137 not built yet |
+| Full XNU26 CI build | PASS, run 41092452347 / ec7a619; actual ARM64 Mach-O, checksum, startup/NOP markers and patches 1131–1136 verified; correction e1458e3 / 41122349335 pending |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
 | Full-kernel QEMU | Probe-3 checker and corrected independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 6920 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
@@ -1506,8 +1509,31 @@ Fresh ordered reconstruction passes **20:13:02Z**, **four staging scripts / 280
 patches / 6369 sources exact**, all historical baseline checks and the complete
 **6369-file pre-1137 ec7a619** inventory; only the documented dxb skips.
 Evidence is in **`preenable-linereset-export/` / `series-check-preenable-linereset/`**;
-patch 1136 and the previous completed delivery remain unchanged. Commit/push and
-replacement CI/image are next.
+patch 1136 and the previous completed delivery remain unchanged. Read-only
+precommit review verifies the complete prepared/reconstructed inventories and
+frozen files, **20:19:01Z**. Source **`e1458e34336cb9bd1d6d5b944b4a7cdea35298e8`**
+is committed/pushed; [Intel CI **41122349335**](https://github.com/friendlycatt/Bergamota/actions/runs/41122349335)
+was queued at dispatch **20:20:22Z**, attempt 1, with the same reviewed
+26.5/DEVELOPMENT/SWEET/Xcode26.1 inputs. Compiler result and replacement image
+remain pending; delivery uses fresh paths, not the frozen original outputs.
+
+Fresh **`preenable-linereset-bringup/package_probe.py --prepare`** exits **0**,
+**20:38:09Z**; input review passes **20:47:10Z**. The separate
+**`research/starlte/preenable-linereset-delivery/`** has the checked
+1740800-byte Image/ELF, hardware UniPro ADT and one-CPU GICv2 QEMU ADT.
+**356 exact candidate source hashes / 6587 protected files / ten reproduction
+scripts** verify. All **6374 expected CI file hashes** were fixed before
+download/archive inspection from the local reconstruction, six dxb substitutions
+and nine reviewed headers. Inventory SHA256:
+**`c076a7d68ace85b766c832571b25d03e0dc84ab84325e02dc65def8e95dc188b`**;
+only `bsd/dev/sweet_ufs.c` differs from the frozen startup expectations.
+All six exception/snapshot helper ASTs match the previous delivery. The planned
+capture uses fresh **`preenable-linereset-qemu-41122349335/`** and short alias
+**`/tmp/opencode/upc-41122349335`**, with the same exception/snapshot policies.
+Evidence and fixed script pins are in
+**`preenable-linereset-bringup/preparation-review.json`**. Packaging, raw-image
+verification and QEMU capture/audit await successful CI inspection.
+
 Physical clearing, startup/NOP/TUR, descriptor/response/data DMA,
 capacity/GPT/repeated userdata reads and root mount remain unverified; no agent
 phone operation occurred.
@@ -1576,7 +1602,7 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Commit/push and build the locally
+1. **Read-only Samsung storage.** Inspect the dispatched build of the locally
    validated/reconstructed [pre-HCE correction](#narrow-pre-hce-linereset-correction), then
    package a fresh startup/NOP image using the supplied Samsung template
    and 512-byte UPIU layout. Keep all transfer checks strict. Obtain actual LUN
