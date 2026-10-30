@@ -10,8 +10,8 @@ the **FMP format call returned 0**. The first TEST UNIT READY command then
 **timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
 The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
 delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
-**4d12ded**. All **6374 source files** and the actual diagnostic binary verify;
-fresh image packaging/audits remain pending.
+**4d12ded**. All **6374 source files**, the diagnostic binary and independent
+Samsung/payload audit verify; fresh QEMU capture/finalization remain pending.
 **Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
@@ -971,7 +971,21 @@ with no missing/different/additional files or exclusions. All **352 source
 hashes / 498 protected artifacts** remain unchanged. The entire **108-line
 link-errors.txt** was viewed: interleaved compiler-warning fragments plus
 duplicate-library/segment-order linker warnings, no established linker failure.
-No probe-3 image is available yet; the current phone result remains probe 2's timeout.
+Probe 3 is now packaged locally as **`boot-starlte-ufs-probe-3.img`**, **10461200
+bytes**, SHA256 **`2f17f8dc2ba9fe5a4ed5bfb838c6e2b4c476d4a4615384e7c745ea6d276f07b4`**.
+Production host-loader validation compares **43778048 RAM bytes exact**, with
+dirty destinations and the source payload unchanged; it does not execute XNU.
+Preparation records, Image/ELF and fresh ADTs are unchanged. Independent raw-image
+verification now exits **0**: Samsung metadata, 2048-byte page, legacy SHA-1,
+unchanged second/DTBH/footer and standalone checksum PASS. The DTBH has one
+Exynos9810/revision 26–255 entry and a **301372-byte FDT**. Hardware and QEMU
+payloads are **8411984 / 8405952 bytes**; all **ten loaded segments in each**
+match the actual CI Mach-O bytes, including bounded raw DEFLATE, entry/end/VA
+and physical bounds. No iOS root RAMDisk is present; fresh seeds and hardware
+DMA placeholders are preserved. A fresh **90-second** QEMU capture is active
+in `research/starlte/ufs-probe-3-qemu-41014066730/`; its completed outcome, actual
+screenshot review and finalization remain pending. The current phone result
+remains probe 2's timeout.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
@@ -996,9 +1010,10 @@ active and real marker checks reject both older kernels. An old-probe-2 format
 smoke also passes **43778048 host-loader RAM bytes exact**, dirty destinations,
 fresh seeds/source unchanged and independent Samsung section/metadata/SHA-1
 checks. These are **not probe-3 CI, Samsung storage or phone execution results**.
-Real artifacts now pass download/reconciliation/inspection. They must still be
-packaged, captured for 90 seconds in QEMU, visually reviewed and independently
-audited before delivery.
+Real artifacts now pass download/reconciliation/inspection, Samsung packaging and
+independent raw-image verification. The active fresh 90-second QEMU capture must
+complete, then pass actual visual review and independent raw/delivery audits
+before delivery. It has no Samsung UFS and cannot validate HCE/FMP/UIC/data DMA.
 
 ## Getting-started guide review for S9
 
