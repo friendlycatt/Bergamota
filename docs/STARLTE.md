@@ -11,7 +11,8 @@ the **FMP format call returned 0**. The first TEST UNIT READY command then
 The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
 delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
 **4d12ded**. All **6374 source files**, the diagnostic binary and independent
-Samsung/payload audit verify; fresh QEMU capture/finalization remain pending.
+Samsung/payload audit verify; the fresh QEMU capture and corrected independent
+audit pass. Real finalization and archive verification remain pending.
 **Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
@@ -982,10 +983,38 @@ Exynos9810/revision 26–255 entry and a **301372-byte FDT**. Hardware and QEMU
 payloads are **8411984 / 8405952 bytes**; all **ten loaded segments in each**
 match the actual CI Mach-O bytes, including bounded raw DEFLATE, entry/end/VA
 and physical bounds. No iOS root RAMDisk is present; fresh seeds and hardware
-DMA placeholders are preserved. A fresh **90-second** QEMU capture is active
-in `research/starlte/ufs-probe-3-qemu-41014066730/`; its completed outcome, actual
-screenshot review and finalization remain pending. The current phone result
-remains probe 2's timeout.
+DMA placeholders are preserved. The fresh **90-second** QEMU capture completed
+in `research/starlte/ufs-probe-3-qemu-41014066730/`: checker **0**, **7078 raw
+console bytes**, **6920 IRQs + one verified retried Skywalk demand fault**,
+`rootvnode=0`, `early_panicking=0`. The actual screenshot shows **FAILED (6),
+writes 0, commands failed 0 / PROBE HOLD**. The underlying white-font runner
+still exits **3 / blank_screen**. The initial independent auditor **failed (1)**
+at its idle-only snapshot assertion: PC is **`_sweet_gic_ack_irq + 0x18`**, not
+`_cpu_idle + 0x220`. CI source/binary/payload verification now proves the exact
+post-IAR instruction site, **INTID 27**, direct caller **`_sleh_irq + 0x34`**,
+masked EL1t state and terminal IRQ from **`_machine_idle + 0xf4`**. The corrected
+guard accepts only this exact IRQ site or the unchanged exact idle site; no later
+IRQ return or new exception permission is claimed. **36 unittest methods / 13
+script syntax checks** and a fresh **15-negative-guard SYNTHETIC finalizer fixture**
+pass with reconciled script pins. The raw auditor abort loop and capture checker
+remain AST-identical to their originals. The corrected real raw audit **v2 also
+failed (1)**: its line 271 incorrectly requires an early GIC `kprintf` message
+in the captured console; no such message is present in the complete ring. This
+led to the fixed-CI-source logging review and v3 correction below.
+Both failed audits, 20 original files, 23 preserved v2 files, all 13 raw capture
+hashes and both fixtures remain intact; no QEMU rerun. The source review confirms
+that early `kprintf` output is conditional, not an unconditional console-ring
+record; the exact runtime reason for this message's absence is not measured.
+The v3 read-only real-main test then exposed a screen-result/DEFLATE variable
+collision in report construction; that failed guard and 18 source/evidence files
+are preserved too. Only the screen-result variable outside the abort loop was
+renamed. Fresh **38 unittest methods / 13 script checks / 15 SYNTHETIC negative
+guards** pass, with **189 fixture manifest entries / 190 archive files exact**.
+The separately recorded **real v3 independent audit exits 0**, validates all
+eight CI-source references and all 13 unchanged capture hashes, and retains the
+unchanged exception and narrowly verified IRQ-site policies. The final paused
+IRQ's return is still unobserved. Real finalization/archive verification remain
+pending. The current phone result remains probe 2's timeout.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
@@ -995,25 +1024,27 @@ All **352 tracked source hashes** match **4d12ded**; all **498 protected
 probe-1/probe-2 files** and the old reproduction suite remain unchanged.
 
 The complete new downloader/profile/inspection/package/capture/finalizer/test
-suite and three independent auditors pass **13 syntax checks / 25 unittest
-methods with adversarial subtests**. The source profile expects **6374 files**,
+suite and three independent auditors initially passed **13 syntax checks / 25
+unittest methods**; the corrected audit suite now passes **38 methods** with
+adversarial and real-main read-only checks. The source profile expects **6374 files**,
 derived from the new local reconstruction, six exact dxb substitutions and
 **nine previously reviewed/hash-pinned external-header copies** prepared before
 examining the new CI archive. No exclusions or learned-from-archive expectations,
 independent SDK/KDK reinstall or byte-identical kernel rebuild are claimed.
 The unchanged exception policy is AST-verified against both older captures.
 
-A **SYNTHETIC format-only** finalizer fixture passes **ten negative guards /
-95 manifest files / exact archive hashes**, explicitly mocking old-kernel,
+A preserved initial **SYNTHETIC format-only** finalizer fixture passed **ten negative
+guards / 95 manifest files / exact archive hashes**, explicitly mocking old-kernel,
 archive-pin and full-source-proof boundaries; the strict metadata guard remains
 active and real marker checks reject both older kernels. An old-probe-2 format
 smoke also passes **43778048 host-loader RAM bytes exact**, dirty destinations,
 fresh seeds/source unchanged and independent Samsung section/metadata/SHA-1
 checks. These are **not probe-3 CI, Samsung storage or phone execution results**.
 Real artifacts now pass download/reconciliation/inspection, Samsung packaging and
-independent raw-image verification. The active fresh 90-second QEMU capture must
-complete, then pass actual visual review and independent raw/delivery audits
-before delivery. It has no Samsung UFS and cannot validate HCE/FMP/UIC/data DMA.
+independent raw-image verification and the capture checker/actual visual review.
+The corrected real IRQ-snapshot audit passes; finalization and archive review
+remain next. Neither failed audit was relabeled. QEMU has no Samsung UFS and
+cannot validate HCE/FMP/UIC/data DMA.
 
 ## Getting-started guide review for S9
 
