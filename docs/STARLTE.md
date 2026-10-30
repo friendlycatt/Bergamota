@@ -25,8 +25,9 @@ startup guard; the [narrowly gated clearing correction](#narrow-pre-hce-linerese
 in additive patch **1137** passes **501 host / 24 ADT / fatal sanitizers /
 real-header compilation / 280-patch / 6369-file reconstruction**. Source
 **e1458e3** is pushed; [Intel CI 41122349335](https://github.com/friendlycatt/Bergamota/actions/runs/41122349335)
-was queued at dispatch. Replacement delivery inputs and all 6374 expected CI
-source hashes are pinned; the new kernel/image remains pending.
+succeeded, attempt 1, **21:10:21Z**. Replacement delivery inputs and all 6374
+expected CI source hashes are pinned; artifact verification and packaging are
+underway.
 UIC/NOP/TUR stay strict.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
@@ -345,7 +346,7 @@ translation support.
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
 | UFS (`ufs.py`) | PASS, 501 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing and deferred boundary output |
 | Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; frozen startup CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
-| Full XNU26 CI build | PASS, run 41092452347 / ec7a619; actual ARM64 Mach-O, checksum, startup/NOP markers and patches 1131–1136 verified; correction e1458e3 / 41122349335 pending |
+| Full XNU26 CI build | PASS, correction e1458e3 / 41122349335 / attempt 1, Intel host and Xcode 26.1.1 verified; actual replacement kernel/source inspection pending |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
 | Full-kernel QEMU | Probe-3 checker and corrected independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 6920 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
@@ -1513,9 +1514,12 @@ patch 1136 and the previous completed delivery remain unchanged. Read-only
 precommit review verifies the complete prepared/reconstructed inventories and
 frozen files, **20:19:01Z**. Source **`e1458e34336cb9bd1d6d5b944b4a7cdea35298e8`**
 is committed/pushed; [Intel CI **41122349335**](https://github.com/friendlycatt/Bergamota/actions/runs/41122349335)
-was queued at dispatch **20:20:22Z**, attempt 1, with the same reviewed
-26.5/DEVELOPMENT/SWEET/Xcode26.1 inputs. Compiler result and replacement image
-remain pending; delivery uses fresh paths, not the frozen original outputs.
+**succeeded**, attempt 1, job **124291514094**, complete **21:10:21Z**. Build
+**20:21:21–21:06:33Z** used the reviewed 26.5/DEVELOPMENT/SWEET/Xcode26.1 inputs;
+actual Deps report **x86_64 / Xcode 26.1.1 / 17B100**. Completion review passes
+**21:29:40Z**. Frozen artifact IDs are kernel **13012226676** and buildtree
+**13012885204**, each with a recorded GitHub ZIP SHA256. Download, complete
+source replay/inspection and replacement packaging are underway.
 
 Fresh **`preenable-linereset-bringup/package_probe.py --prepare`** exits **0**,
 **20:38:09Z**; input review passes **20:47:10Z**. The separate
@@ -1532,7 +1536,7 @@ capture uses fresh **`preenable-linereset-qemu-41122349335/`** and short alias
 **`/tmp/opencode/upc-41122349335`**, with the same exception/snapshot policies.
 Evidence and fixed script pins are in
 **`preenable-linereset-bringup/preparation-review.json`**. Packaging, raw-image
-verification and QEMU capture/audit await successful CI inspection.
+verification and QEMU capture/audit await successful artifact inspection.
 
 Physical clearing, startup/NOP/TUR, descriptor/response/data DMA,
 capacity/GPT/repeated userdata reads and root mount remain unverified; no agent
