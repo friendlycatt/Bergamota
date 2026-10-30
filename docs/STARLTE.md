@@ -4,23 +4,22 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F / G960FD),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-30:** the [probe-2 photograph](#photographed-ufs-probe-2-result)
-shows the bounded **HCE enable succeeded** (`HCE=1`, `HCS=0x10f`, `IS=0`) and
-the **FMP format call returned 0**. The first TEST UNIT READY command then
-**timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
-The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and
-delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
-**4d12ded**. All **6374 source files**, the diagnostic binary and independent
-Samsung/payload audit verify; the QEMU capture and corrected independent
-audit pass. [Probe-3 software delivery](#ufs-probe-3-software-delivery) is now
-**complete**: real finalization and independent delivery audit both exit **0**,
-all **189 manifest entries / 190 archive files exact**. The next result is the
-whole-screen phone photograph, not another software build or audit.
-**Samsung media reads and an iOS root mount remain unverified**.
-The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
-**40955206538** are verified; all **148 manifest entries / 149 archive files**
-match. Local transport/compilation checks and the audited QEMU failure hold pass.
-The physical
+**Status, 2026-10-30:** the [probe-3 photograph](#photographed-ufs-probe-3-result)
+shows first **PA `0x80000010`**, then **PA=0**, with both pre-cleanup samples
+reporting **IS=4 / HCE=1 / HCS=0x10f / DBR 1->1 / OCS=0x0f**. The first
+TEST UNIT READY still times out: **FAILED (60), writes 0, commands failed 1 /
+PROBE HOLD**. The source/descriptor review is complete; the timeout cause
+and PA indication's timing remain unclassified. The
+[selected next experiment](#selected-next-read-only-experiment) adds bounded
+pre-enable/pre-TUR UIC samples and holds on any sampled error; implementation
+and a new image are pending. **Samsung media reads and an iOS root mount
+remain unverified**.
+
+[Probe-3 software delivery](#ufs-probe-3-software-delivery) is complete:
+Intel CI **41014066730 / 4d12ded** succeeded; all **6374 source files**,
+diagnostic binary, Samsung/payload audit and corrected QEMU audit verify.
+Actual finalization and independent delivery audit both exit **0**,
+all **189 manifest entries / 190 archive files exact**. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
@@ -324,11 +323,11 @@ translation support.
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
 | UFS (`ufs.py`) | PASS, 161 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
-| Ordered patch reconstruction | PASS: local four-stage / 277-patch reconstruction, 6369 files and baseline hashes exact; prior probe-2 CI profile (276 patches) reconstructs 6374 files with six dxb substitutions and real KDK staging; two documented dxb skips |
-| Full XNU26 CI build | PASS, run 40955206538; actual ARM64 Mach-O, checksum, HCE markers and patches 1131–1133 verified |
+| Ordered patch reconstruction | PASS: local four-stage / 277-patch reconstruction, 6369 files and baseline hashes exact; probe-3 CI profile reconstructs all 6374 files with six dxb substitutions and nine prior-reviewed header copies; two documented dxb skips |
+| Full XNU26 CI build | PASS, run 41014066730 / 4d12ded; actual ARM64 Mach-O, checksum, pre-cleanup markers and patches 1131–1134 verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
-| Full-kernel QEMU | Probe-2 checker 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 7055 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
+| Full-kernel QEMU | Probe-3 checker and corrected independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 6920 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
 | Renegade platform/root preview | PASS, 24 tests and one macOS-only signer-parity skip; includes ios18/ios26 × Linux/macOS full previews before downloads |
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
@@ -337,12 +336,14 @@ Patch 1132 is 34532 bytes for `bsd/dev/sweet_ufs.c`, SHA256
 `6ee211f1f329c2f572dde7cc614780227da45b11e21bdaf9dfed9299164587a6`.
 Patch 1133 is 6172 bytes, SHA256
 `aeb561be8a745543a00dd7216140b45ea49e90bb30a10231c0923709c809c73b`.
+Patch 1134 is 6088 bytes, SHA256
+`ddf2dff41396c6a233a4bf591cca17c32c3ea3224001782ef4dbbeeb712766de`.
 The reconstruction uses XNU `xnu-12377.121.6` at
 `ac9718fb1af618d5ce8678d0dc6e8a58f252216f` and dxb at
 `663906528d1cd5ea8fde7de6f16de73db9511549`. The latest local reconstruction
-is retained in ignored `research/starlte/series-check-ufs-probe-2/`; the reviewed
+is retained in ignored `research/starlte/series-check-ufs-probe-3/`; the reviewed
 CI-profile replay is in
-`research/starlte/ufs-probe-2-bringup/ci-40955206538-source-profile-v2/`.
+`research/starlte/ufs-probe-3-bringup/ci-41014066730-source-profile/`.
 The freestanding guests establish component behavior. The full-kernel
 observations below extend this to QEMU startup execution. The physical
 probe establishes Enxerto entry and visible panel refresh. The later user
@@ -898,12 +899,11 @@ a reset/retry policy. The current UFSHCI 2.1 command type **1** and per-command
 Nexus setup agree with the reference; no particular descriptor-format bug has
 been established.
 
-The current timeout path writes `UTRLCLR` **before** printing DBR, and replaces
+Probe 2's timeout path writes `UTRLCLR` **before** printing DBR, and replaces
 the recorded OCS with `0xff`. Thus **DBR=0 is post-cleanup**, not evidence of
 natural completion. The `host stopped` suffix means software quarantine
-(`su.dead`), not a measured hardware/list stop. The next additive probe will
-capture first-error and terminal request/UIC/descriptor state before cleanup,
-with bounded output and continued DMA quarantine.
+(`su.dead`), not a measured hardware/list stop. This motivated the additive
+pre-cleanup diagnostics below, with bounded output and continued DMA quarantine.
 
 Baseline driver/tests and completed probe-1/probe-2 evidence are preserved in
 fresh `research/starlte/ufs-probe-3-bringup/`: seven source/documentation copies,
@@ -1017,8 +1017,8 @@ The separately recorded **real v3 independent audit exits 0**, validates all
 eight CI-source references and all 13 unchanged capture hashes, and retains the
 unchanged exception and narrowly verified IRQ-site policies. The final paused
 IRQ's return is still unobserved. Real finalization and independent archive
-verification are now complete, as recorded below. The current phone result
-remains probe 2's timeout.
+verification are complete, as recorded below. The subsequent
+[probe-3 photograph](#photographed-ufs-probe-3-result) supplies the physical result.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
@@ -1101,21 +1101,144 @@ its actual report/log SHA256 is
 **Do not rerun** any completed CI/download/packaging/capture/audit/guard/fixture
 or finalizer path, or edit the frozen delivery/archive.
 
-Use the already selected **TWRP / OrangeFox** test-image route; no extra recovery
-check or phone-flashing/formatting command is supplied. Photograph the **whole
-screen**, including both **first-error / terminal** live samples: **IS/HCE/HCS**,
-**UIC PA/DL/NL/TL/DME**, **list/DBR/RSR/TM**, **UTRD0-7/OCS**, **RESP0-15**,
-the failure/write counters and **PROBE HOLD**. Include earlier HCE/FMP/read lines
-if visible; if it stalls earlier, capture the last line. Commands stay read-only
-even with `ufsrw=1`; the bounded wait/clear, permanent quarantine and pre-BSD/root
-hold remain. Preserve recovery, bootloaders, modem, persist and partition backups;
-do not put this boot image in userdata or other non-boot partitions.
+The user's [probe-3 photograph](#photographed-ufs-probe-3-result) is now received
+and interpreted. The selected test-image route remains **TWRP / OrangeFox**.
+Commands stay read-only even with `ufsrw=1`; the bounded wait/clear, permanent
+quarantine and pre-BSD/root hold remain. Preserve recovery, bootloaders, modem,
+persist and partition backups; do not put this boot image in userdata or other
+non-boot partitions.
 
 The agent performed **no phone operations**. Samsung descriptor/data-DMA
 acceptance, media capacity/GPT and repeated userdata reads remain unverified.
 No Apple root was downloaded or built, and no root mount/userspace proof exists.
 Root preparation follows measured Samsung reads; any destructive operation on
 the existing userdata partition needs separate confirmation, with no GPT changes.
+
+### Photographed UFS probe 3 result
+
+The original user JPEG was located and directly viewed on **2026-10-30**:
+**230972 bytes**, SHA256
+**`dc0f6b9493bee7dc69d763a522c33429cdba10cc88381deb8d98a8c8e68d3102`**.
+Its byte-exact copy, three nearest-neighbor crops and curated UFS-tail
+transcription are in ignored `research/starlte/device-ufs-probe-3/`.
+The screen contains probe 3's new markers; an installed-image checksum was
+not supplied. The HCE enable again reaches **1 / HCS `0x10f` / IS=0**, and
+the FMP DESCTYPE 3 call returns **0**. The two live samples show:
+
+| Field | First error | Timeout, before request clear |
+| --- | --- | --- |
+| Command / LUN | TUR `0x00` / 0 | TUR `0x00` / 0 |
+| IS / HCE / HCS | `0x4` / `1` / `0x10f` | `0x4` / `1` / `0x10f` |
+| PA | `0x80000010` | `0` |
+| DL / NL / TL / DME | All zero | All zero |
+| Transfer DBR before/after sample | `1 -> 1` | `1 -> 1` |
+| Transfer RSR / task DBR / task RSR | `1 / 0 / 0` | `1 / 0 / 0` |
+| UTRL base | `0x80140000` | `0x80140000` |
+| OCS / sampled 16-byte response header | `0x0f` / all zero | `0x0f` / all zero |
+
+After request clear the screen reports **DBR=0**, **FAILED (60), writes 0,
+commands failed 1 / PROBE HOLD**. The request was still pending at both sampled
+boundaries. These are non-atomic samples saved before cleanup and printed
+afterward. The printed **`post-clear is 0x4`** is saved after `UTRLCLR` but
+**before IS acknowledgement**; DBR=0 is cleanup, not natural completion.
+Timeout statistics substitute `last_ocs=0xff`, distinct from the sampled **0x0f**.
+
+Runtime pool **`0x80140000+0x104000`** ends at **`0x80244000`**, within the Image
+mapping **`0x8009c000+0x1ac000`**, ending at **`0x80248000`**. Inherited UTRL base
+is **`0x00000000ef002000`**, CAP **`0x1303ff0f`**, version **`0x210`** and FORCE
+**`0xde0`** (probe 2 showed `0xae0`). These are this boot's observations, not
+addresses/settings to hardcode or proof of controller DMA access.
+
+**Independent UTRD decoding:** both samples contain these eight little-endian
+words, consistent with the actual CI driver's current layout:
+
+```text
+11000000 00000000 0000000f 00000000 80141000 00000000 02000200 04000000
+```
+
+* DW0: command type **1 / UFS_STORAGE**, interrupt-command bit set, **no data**
+  direction. Samsung selects this command type for UFSHCI 2.1
+  ([`ufshcd.c`][samsung-ufshcd]:1952–1966).
+* DW1/DW3: reserved zero; DW2: **OCS_INVALID_COMMAND_STATUS `0x0f`**, the
+  software initializer. No completed success or descriptor-error status appears.
+* DW4/DW5: UCD **`0x80141000`**, pool + `0x1000`, aligned to 128 bytes.
+* DW6: response **offset 512 / length 512 bytes**, address **`0x80141200`**.
+* DW7: PRDT **offset 1024 / length 0 bytes**, address **`0x80141400`**.
+  Samsung's byte-granularity quirk applies; TUR has no data PRDs.
+
+The 1536-byte local UCD ends at `0x80141600`, before bounce data at `0x80144000`.
+Visible software descriptors, HCS readiness and a zero FMP return cannot
+distinguish no controller fetch from fetched-but-unfinished work. Only 16
+response bytes were sampled; **TUR transfers no media data**.
+
+**PA interpretation:** [Samsung `ufshci.h`][samsung-ufshci]:171–172 defines the
+valid bit 31 and code mask `0x1f`. The per-bit names come from supplemental
+[Linux v6.6 `ufshci.h`][linux66-ufshci]:235–236: lane mask `0xf`, generic bit
+`0x10`. Its [core driver][linux66-ufshcd]:6592–6605 calls the generic indication
+**LINERESET**. No lane bits or separate **DL.PA_INIT bit 13** are present in
+the samples. Linux also explicitly reads UECPA to clear a LINK_STARTUP
+indication (4897–4898). PA becoming zero is consistent with read-clearing;
+this photograph does not establish the clearing mechanism or event timing.
+The initial/post-enable IS=0 readings did not sample the layer-code registers.
+The photograph supplies neither a measured timeout duration nor a hardware
+virtual-timer trace, and does not classify the timeout's cause.
+
+**Layout comparison:** the pinned Samsung header uses **1024-byte** command
+and response slots, with response/PRDT offsets **1024/2048**. The
+[Samsung history change][samsung-upiu1024] (`a4bd396`, `Merge N960FXXU9FVH1`)
+changes the previous 512-byte value; older Samsung and Linux v6.6 use **512**.
+A local 1024-byte-slot TUR would encode DW6/DW7 **`04000400 / 08000000`** and
+use **2560 bytes** with four 128-byte PRDs, fitting the **12288-byte** reserved
+UCD space before the bounce buffer. This is a source compatibility difference,
+not a demonstrated hardware requirement or tested fix. Retain it for a later
+one-variable comparison after the directly observed PA/UIC timing gap is measured.
+
+The one-shot `interpret_photo.py` exits **0** at **12:33:34Z**. Its complete
+`descriptor-review.json` was directly reviewed, SHA256
+**`5209f41a048873cbe19bb8ba17962bfd86979b7f914fa16a116b594cbd93eea4`**.
+`reference-provenance.json` pins 18 source/provenance files, the actual CI driver
+and Samsung history; supplemental Linux is commit
+**`ffc253263a1375a65fa6c9f62a893e9767fbebfa`**. Full source headers are retained.
+These records and the physical evidence remain outside the frozen delivery.
+
+#### Selected next read-only experiment
+
+**`starlte-pre-submit-uic-boundaries-v1` — selected; implementation, local
+validation, CI and image pending.** Keep the current **512-byte UPIU layout**
+to measure whether the indication is already recorded before command submission:
+
+1. After idle/list-stop verification, sample at the existing **pre-enable
+   check**, before HCE enable. Sample this boundary on an already-enabled host
+   too, retaining its enable-skipped behavior.
+2. After descriptor/Nexus preparation, sample **immediately before the first
+   TUR doorbell**. Both samples record raw **IS/HCE/HCS**, both **DBRs** and
+   **PA/DL/NL/TL/DME** from the already mapped standard HCI window.
+
+Allow at most **two new two-line samples per boot**, on the exact Exynos
+read-only probe path, alongside patch 1134's at-most-two six-line samples.
+Latch all values before any subsequent acknowledgement. A sampled **IS error
+or any nonzero UIC error-code register** must latch failure/quarantine and
+reach the existing hold **before the next setup action/doorbell**; later zeros
+cannot erase the earlier evidence. Keep Image-owned DMA32/Normal-NC, FMP-bypass
+descriptors, pending-request checks, the five-second deadline/bounded positive-bit
+clear, permanent quarantine, cached failures and pre-BSD/root hold. Exynos
+remains read-only even with `ufsrw=1`. Add no reset/link/PHY/clock operation,
+retry after quarantine, descriptor-pointer chase, pending-DMA clean or media dump.
+
+The first boundary follows the existing takeover IS acknowledgement/list stop;
+it is not an untouched bootloader-entry snapshot. Earlier rejection can prevent
+it from being reached, and its own failure intentionally prevents the second
+sample. MMIO reads may clear latches and affect timing; these sequential samples
+are not atomic or passive. A first-boundary indication predates the later TUR;
+a new second-boundary indication narrows it to setup; one first seen while TUR
+is pending narrows it to after the final boundary, without proving command causality.
+
+Required before a new CI build: fresh host MMIO sequencing/read-clear/error
+latching checks, no doorbell after pre-submit failure, bounded output, cached
+failure/late-DMA quarantine and Qualcomm regressions; full real-header compilation
+and additive-patch reconstruction. Continue reconciling every actual CI source
+file against independently fixed expectations and prior-reviewed header pins.
+Root preparation still awaits measured capacity/GPT and repeated userdata reads.
 
 ## Getting-started guide review for S9
 
@@ -1181,15 +1304,15 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Test the completed
-   [probe-3 delivery](#ufs-probe-3-software-delivery) and photograph both pre-cleanup
-   samples to diagnose probe 2's first-command UIC timeout. Obtain actual LUN
-   capacity/GPT and repeated userdata reads
-   before preparing the iOS26 root. A userdata write needs explicit confirmation.
-2. **Complete the physical XNU record.** Probe 2 establishes HCE enable and
-   the FMP return, followed by a first-command UIC timeout and failure hold.
-   Capture probe 3's whole-screen first-error/terminal UIC/list/UTRD/response
-   samples, counters and PROBE HOLD, or the last visible line if it stalls earlier.
+1. **Read-only Samsung storage.** Implement and locally validate the
+   [selected pre-submit UIC experiment](#selected-next-read-only-experiment),
+   then build a fresh CI/image with the 512-byte baseline. Obtain actual LUN
+   capacity/GPT and repeated userdata reads before preparing the iOS26 root.
+   A destructive userdata operation needs separate confirmation; no GPT changes.
+2. **Extend the physical XNU record.** Probe 3's photograph and source review
+   are complete: PA `0x80000010 -> 0`, pending DBR and initializer OCS before
+   cleanup, then failure hold. Photograph the next experiment's boundary samples,
+   any first-error/terminal samples, counters and hold (or last visible line).
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
    observed zero `CNTFRQ_EL0` register.
@@ -1209,6 +1332,9 @@ new UFS probe above.
 [samsung-ufshcd]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufshcd.c
 [samsung-ufshci]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/scsi/ufs/ufshci.h
 [samsung-fmp]: https://github.com/duhansysl/exynos9810-kernel/blob/914eabe7b6799ab0eb159360a5f9731dd50d0f1d/drivers/crypto/fmp/fmp.c
+[samsung-upiu1024]: https://github.com/duhansysl/exynos9810-kernel/commit/a4bd396b7c2d46cf74e4eb1f9a8300f944efd8fb
+[linux66-ufshci]: https://github.com/torvalds/linux/blob/ffc253263a1375a65fa6c9f62a893e9767fbebfa/include/ufs/ufshci.h
+[linux66-ufshcd]: https://github.com/torvalds/linux/blob/ffc253263a1375a65fa6c9f62a893e9767fbebfa/drivers/ufs/core/ufshcd.c
 [mu]: https://github.com/Project-Silicium/Mu-Silicium/tree/7a2ada19841a129f86fb791c0b9a710436c849a4
 [mu-dts]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Resources/DTBs/starlte.dts
 [mu-memory]: https://github.com/Project-Silicium/Mu-Silicium/blob/7a2ada19841a129f86fb791c0b9a710436c849a4/Platforms/Samsung/starltePkg/Library/MemoryMapLib/MemoryMapLib.c
