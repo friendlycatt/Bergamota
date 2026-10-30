@@ -13,8 +13,12 @@ and PA indication's timing remain unclassified. The active
 [startup/NOP candidate](#opt-in-link-startup-and-nop-candidate), patch **1136**
 on `starlte/ufs-link-startup`, addresses the missing post-HCE transport sequence:
 **329 host scenarios / 24 ADT cases / real-header compile** and
-**279-patch / 6369-file reconstruction PASS**. Candidate CI/image and physical
-validation are next. Probe 4's [boundary experiment](#selected-next-read-only-experiment)
+**279-patch / 6369-file reconstruction PASS**. Source **ec7a619** is pushed;
+[Intel CI 41092452347](https://github.com/friendlycatt/Bergamota/actions/runs/41092452347)
+is dispatched. The candidate loader/ADTs and **6374 pre-fixed expected CI source
+hashes** are prepared; kernel inspection, image packaging and physical validation
+are next.
+Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
 **Samsung media reads and an iOS root mount
 remain unverified**.
@@ -1342,8 +1346,25 @@ tree/log/script remain in **`series-check-link-startup/`**. Fresh same-source
 reconstruction passed **16:30:25Z**, **four stages / 279 patches / 6369 files
 exact**, with only the two documented dxb skips. Candidate evidence lives under
 this worktree's **`research/starlte/link-startup-check-1/`**, **`link-startup-export/`**
-and **`series-check-link-startup-retry1/`**. Probe-4's main-checkout source and
-fixed CI expectations remain pinned independently.
+and **`series-check-link-startup-retry1/`**. Final review verified seven staged
+files, 31 local links and exact tested source/model/ADT bytes. Source
+**`ec7a619205894b4759f18618ee01e0528068c58c`** was committed/pushed and its remote
+SHA verified. Intel CI **41092452347** was dispatched **16:43:23Z**, selecting
+26.5 / DEVELOPMENT / SWEET / Xcode 26.1 / Intel / KDK / keep-going. Its
+one-shot watcher and fresh preparation are in **`link-startup-bringup/`**.
+Probe-4's main-checkout source and fixed CI expectations remain pinned independently.
+
+Candidate delivery preparation passed **16:59:49Z**. **`link-startup-delivery/`**
+contains the checked normal **1740800-byte** Image/ELF and fresh hardware/QEMU
+ADTs. The hardware tree includes the exact UniPro region; payloads will use
+**`ufsprobe=1 ufslinkinit=1`**. All **355 tracked source hashes / 1108 protected
+prior files** verify. The **6374-file** CI expectation inventory was fixed
+before any new artifact download or archive read, using the local reconstruction,
+six pinned build-script substitutions and nine prior-reviewed header copies.
+Its SHA256 is **`8744dac99cc42080fdba80d7c70f3e6a438ceebe036938b6a0708ef15b11b3be`**.
+The delivery suite preserves the established exception and snapshot policies;
+their six implementation helpers are unchanged. Download/CI inspection, actual
+image packaging and a new full-kernel QEMU capture are still pending.
 
 ## Getting-started guide review for S9
 
