@@ -10,7 +10,8 @@ the **FMP format call returned 0**. The first TEST UNIT READY command then
 **timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
 The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
 delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
-**4d12ded**. Fresh artifact reconciliation and image audits remain pending.
+**4d12ded**. All **6374 source files** and the actual diagnostic binary verify;
+fresh image packaging/audits remain pending.
 **Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
@@ -959,8 +960,18 @@ in errors.txt / no failed objects**; raw `error:` substrings include expected
 patch-check skips and interleaved warnings, not all compiler failures.
 Artifacts **xnu-kernel 12960019646 / 174382572 ZIP bytes** and
 **xnu-buildtree 12960388132 / 30964317 ZIP bytes** are unexpired. Fresh downloads,
-complete source-profile replay and actual kernel inspection are active; no
-probe-3 image is available yet. The current phone result remains probe 2's timeout.
+complete source-profile replay and actual kernel inspection now exit **0**.
+The new kernel is **22213504 bytes**, SHA256
+**`f9005570abeb56999f37d4a8879c2873442c45f2351e1fb262789228e7f16f2f`**:
+ARM64 DEVELOPMENT/SWEET, CI checksum, all new diagnostic markers/symbols and
+zero-byte errors.txt verified. The actual **31280071-byte build-tree TGZ** is
+pinned as **`5c1615f905a6016f060121e8420cc60b5e861ee9e659ff0bb75a9b85ed1b8f3c`**.
+The five-stage **277-patch** replay and actual archive match **6374/6374 files**,
+with no missing/different/additional files or exclusions. All **352 source
+hashes / 498 protected artifacts** remain unchanged. The entire **108-line
+link-errors.txt** was viewed: interleaved compiler-warning fragments plus
+duplicate-library/segment-order linker warnings, no established linker failure.
+No probe-3 image is available yet; the current phone result remains probe 2's timeout.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
@@ -985,8 +996,9 @@ active and real marker checks reject both older kernels. An old-probe-2 format
 smoke also passes **43778048 host-loader RAM bytes exact**, dirty destinations,
 fresh seeds/source unchanged and independent Samsung section/metadata/SHA-1
 checks. These are **not probe-3 CI, Samsung storage or phone execution results**.
-Real artifacts must still be downloaded/reconciled, packaged, captured for
-90 seconds in QEMU, visually reviewed and independently audited before delivery.
+Real artifacts now pass download/reconciliation/inspection. They must still be
+packaged, captured for 90 seconds in QEMU, visually reviewed and independently
+audited before delivery.
 
 ## Getting-started guide review for S9
 
