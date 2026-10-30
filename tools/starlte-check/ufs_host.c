@@ -187,16 +187,20 @@ struct model {
 	bool fail_alloc, fail_verify_alloc, expect_hold, waiting_hold;
 	bool pending_live, error_sent, uic_read_clear, drop_error_is, complete_on_uic;
 	bool corrupt_on_clear, corrupt_on_ack;
+	bool trace_boundaries, lists_stopped, boundary_fault_sent, boundary_is_read_clear;
+	bool boundary_hce_off;
 	uint64_t smc_result, now, wake, pa, allocation_pa;
 	uint64_t hce_start, hce_latency, hce_completed;
 	uint64_t command_start, error_delay, complete_delay;
 	uint32_t hce_hcs, hce_is, hce_dbr, hce_tm_dbr, hce_rsr, hce_tm_rsr;
 	uint32_t fault_is, fault_uic[5];
+	uint32_t boundary_is, boundary_uic[5], boundary_dbr, boundary_tm_dbr, boundary_hcs_clear;
 	uint32_t r[128], v[128], size, clear_value, visits;
 	unsigned mmio_reads, mmio_writes, vendor_writes, commands, writes, syncs;
 	unsigned base_writes, allocations, maps, smcs, barriers, cache_ops, sleeps;
 	unsigned hce_enables, hce_echo_reads, hce_init_reads;
 	unsigned uic_reads[5], clears, command_acks;
+	unsigned pre_uic_samples, nexus_writes, boundary_fault, boundary_last_writes;
 	unsigned bdevs, cdevs, nodes, last_prds, last_len, last_op;
 	unsigned opcount[256], fault_left, fault_skip;
 	int fault_op;
@@ -213,10 +217,19 @@ struct model {
 	char rootname[65];
 	char console[131072];
 	size_t console_size;
+	struct { char kind; bool vendor; uint32_t off, value; } pre_events[4096];
+	unsigned pre_event_count;
 } m;
 static uint8_t fixture_data[2][4096 + 8192 + 4096];
 static uint8_t wire[1u << 20];
 static jmp_buf hold;
+
+static void model_event(char kind, bool vendor, uint32_t off, uint32_t value)
+{
+	if (!m.trace_boundaries || m.commands) { return; }
+	CHECK(m.pre_event_count < sizeof(m.pre_events) / sizeof(m.pre_events[0]));
+	m.pre_events[m.pre_event_count++] = (typeof(m.pre_events[0])){ kind, vendor, off, value };
+}
 
 static int model_printf(const char *format, ...)
 {
@@ -225,6 +238,7 @@ static int model_printf(const char *format, ...)
 	int n = vsnprintf(m.console + m.console_size, sizeof(m.console) - m.console_size, format, args);
 	va_end(args);
 	CHECK(n >= 0 && (size_t)n < sizeof(m.console) - m.console_size);
+	model_event('p', false, 0, n);
 	fwrite(m.console + m.console_size, 1, n, stdout);
 	m.console_size += n;
 	return n;
@@ -580,6 +594,34 @@ static void model_command_progress(void)
 	if (m.complete_delay && elapsed >= m.complete_delay) { model_pending_complete(); }
 }
 
+/* Inject after the software's earlier idle/readiness checks, on the next IS
+ * observation after list stop or Nexus preparation. This also exposes a
+ * driver that re-reads a cleared error instead of retaining its first value.
+ */
+static void model_boundary_progress(uint32_t off, bool vendor)
+{
+	if (vendor || off != 0x20 || m.commands || !m.lists_stopped) { return; }
+	if (m.nexus_writes) {
+		/* Independent raw 512-byte-slot TUR layout check, even if no
+		 * doorbell is ever submitted. No driver structure offsets used.
+		 */
+		CHECK(le32(m.dma) == 0x11000000 && le32(m.dma + 8) == 15);
+		CHECK(le64(m.dma + 16) == m.pa + 0x1000);
+		CHECK(le32(m.dma + 24) == 0x02000200 && le32(m.dma + 28) == 0x04000000);
+		CHECK(m.dma[0x1000] == 1 && m.dma[0x1001] == 0 && m.dma[0x1010] == 0);
+		for (unsigned i = 0; i < 512; i++) { CHECK(m.dma[0x1200 + i] == 0); }
+	}
+	if (!m.boundary_fault || m.boundary_fault_sent ||
+	    m.boundary_fault != (m.nexus_writes ? 2u : 1u)) { return; }
+	m.boundary_fault_sent = true;
+	m.r[0x20 / 4] |= m.boundary_is;
+	for (unsigned i = 0; i < 5; i++) { m.r[0x38 / 4 + i] = m.boundary_uic[i]; }
+	m.r[0x58 / 4] |= m.boundary_dbr;
+	m.r[0x78 / 4] |= m.boundary_tm_dbr;
+	m.r[0x30 / 4] &= ~m.boundary_hcs_clear;
+	if (m.boundary_hce_off) { m.r[0x34 / 4] = 0; }
+}
+
 static uint32_t model_rd(uint32_t off, bool vendor)
 {
 	CHECK((vendor ? m.vendor_mapped : m.hci_mapped) && off < 0x200 && !(off & 3));
@@ -590,9 +632,15 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 	}
 	model_enable_progress();
 	model_command_progress();
+	model_boundary_progress(off, vendor);
 	uint32_t value = (vendor ? m.v : m.r)[off / 4];
 	if (!vendor && off >= 0x38 && off <= 0x48) {
-		CHECK(m.exynos && m.commands); /* Qualcomm and successful setup do not sample UIC codes. */
+		CHECK(m.exynos); /* No layer-code reads on Qualcomm, even with ufsprobe=1. */
+		if (!m.commands) {
+			CHECK(m.lists_stopped);
+			if (off == 0x38) { CHECK(++m.pre_uic_samples <= 2); }
+			if (off == 0x48) { m.boundary_last_writes = m.mmio_writes; }
+		}
 		m.uic_reads[(off - 0x38) / 4]++;
 		if (m.uic_read_clear) { m.r[off / 4] = 0; }
 		if (off == 0x48 && m.complete_on_uic && m.pending_live) { model_pending_complete(); }
@@ -600,6 +648,10 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 	if (!vendor && off == 0x20 && m.drop_error_is && m.commands) {
 		m.r[off / 4] &= ~m.fault_is;
 	}
+	if (!vendor && off == 0x20 && m.boundary_fault_sent && m.boundary_is_read_clear && !m.commands) {
+		m.r[off / 4] &= ~m.boundary_is;
+	}
+	model_event('r', vendor, off, value);
 	return value;
 }
 
@@ -616,6 +668,7 @@ static void model_cleanup_corruption(void)
 static void model_wr(uint32_t off, uint32_t value, bool vendor)
 {
 	CHECK((vendor ? m.vendor_mapped : m.hci_mapped) && off < 0x200 && !(off & 3));
+	model_event('w', vendor, off, value);
 	m.mmio_writes++;
 	if (vendor) {
 		CHECK(m.exynos);
@@ -623,6 +676,7 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 		m.vendor_writes++;
 		if (m.prdt_stuck && (off == 0 || off == 4)) { return; }
 		if (m.nexus_stuck && off == 0x40) { return; }
+		if (off == 0x40) { m.nexus_writes++; }
 		m.v[off / 4] = value;
 		return;
 	}
@@ -665,6 +719,7 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 		if (m.base_stuck) { return; }
 	}
 	m.r[off / 4] = value;
+	if (off == 0x80 && !value && !m.r[0x60 / 4]) { m.lists_stopped = true; }
 	if (off == 0x58) { model_command(); }
 }
 
@@ -673,10 +728,11 @@ static uint64_t model_smc(void)
 	CHECK(m.exynos && !m.r[0x60 / 4] && !m.r[0x80 / 4]);
 	CHECK(!m.r[0x58 / 4] && !m.r[0x78 / 4]);
 	CHECK(!m.hce_pending && (m.r[0x34 / 4] & 1) && (m.r[0x30 / 4] & 0xff) == 0xf);
+	model_event('s', false, 0, 0);
 	m.smcs++;
 	return m.smc_result;
 }
-static void model_barrier(void) { m.barriers++; }
+static void model_barrier(void) { model_event('b', false, 0, 0); m.barriers++; }
 static void sweet_dma_sync_va(const void *va, uint32_t len) {
 	CHECK(!m.exynos && (uintptr_t)va >= (uintptr_t)m.dma);
 	CHECK((uintptr_t)va - (uintptr_t)m.dma <= m.size && len <= m.size - ((uintptr_t)va - (uintptr_t)m.dma));
@@ -689,8 +745,8 @@ static void clean_dcache64(addr64_t pa, uint32_t len, int physical) {
 	flush_dcache64(pa, len, physical);
 }
 static void nanoseconds_to_absolutetime(uint64_t n, uint64_t *out) { *out = n; }
-static uint64_t mach_absolute_time(void) { m.now += 1000000; return m.now; }
-static void delay(int us) { CHECK(us >= 0); m.now += (uint64_t)us * 1000; }
+static uint64_t mach_absolute_time(void) { model_event('t', false, 0, 0); m.now += 1000000; return m.now; }
+static void delay(int us) { CHECK(us >= 0); model_event('d', false, 0, us); m.now += (uint64_t)us * 1000; }
 static int assert_wait_deadline_with_leeway(event_t event, int mode, int urgency, uint64_t wake, uint64_t leeway) {
 	m.wake = wake; return THREAD_WAITING;
 }
@@ -1071,7 +1127,7 @@ static void diagnostic_samples(unsigned count)
 	CHECK(occurrences("STARLTE UFS: UTRD0-3 LE ") == count);
 	CHECK(occurrences("STARLTE UFS: UTRD4-7 LE ") == count);
 	CHECK(occurrences("STARLTE UFS: RESP0-15 BE ") == count);
-	for (unsigned i = 0; i < 5; i++) { CHECK(m.uic_reads[i] == count); }
+	for (unsigned i = 0; i < 5; i++) { CHECK(m.uic_reads[i] == count + m.pre_uic_samples); }
 }
 
 static void diagnostic_quarantine(void)
@@ -1249,6 +1305,251 @@ static void test_diagnostics(void)
 	CHECK(accesses == m.mmio_reads + m.mmio_writes && crc32(0, m.dma, m.size) == digest);
 	CHECK(!m.bdevs && !m.writes && !ss.retries && m.commands == 1);
 	passed(case_name);
+}
+
+static void probe_to_hold(void)
+{
+	m.expect_hold = true;
+	if (!setjmp(hold)) { dev_t dev; (void)sweet_ufs_rootdev(&dev); CHECK(false); }
+	CHECK(!m.bdevs && !m.cdevs && !m.nodes && !services && !sweet_ufs_lock && !su.ready);
+}
+
+static void boundary_probe(void)
+{
+	reset_model(true, 4096);
+	arg("ufsprobe", 1); arg("ufsrw", 1);
+	m.trace_boundaries = true;
+	m.uic_read_clear = m.boundary_is_read_clear = true;
+}
+
+static void boundary_samples(unsigned count)
+{
+	CHECK(count <= 2 && m.pre_uic_samples == count);
+	CHECK(occurrences("STARLTE UFS: boundary ") == 2 * count);
+	CHECK(occurrences("boundary pre-enable ") == (count > 0));
+	CHECK(occurrences("boundary pre-TUR ") == (count > 1));
+	CHECK(occurrences("boundary UIC PA ") == count);
+}
+
+static void boundary_trace(unsigned count, bool submitted)
+{
+	/* Ten standard-window reads per sample, in source order, without
+	 * intervening MMIO writes, SMC, delay, barrier or console operations.
+	 */
+	static const uint32_t offsets[] = { 0x20, 0x34, 0x30, 0x58, 0x78, 0x38, 0x3c, 0x40, 0x44, 0x48 };
+	unsigned starts[2], found = 0;
+	for (unsigned i = 0; i < m.pre_event_count; i++) {
+		const typeof(m.pre_events[0]) *e = &m.pre_events[i];
+		if (e->kind != 'r' || e->vendor || e->off != 0x38) { continue; }
+		CHECK(found < 2 && i >= 5 && i + 4 < m.pre_event_count);
+		unsigned start = i - 5;
+		starts[found++] = start;
+		for (unsigned j = 0; j < 10; j++) {
+			e = &m.pre_events[start + j];
+			CHECK(e->kind == 'r' && !e->vendor && e->off == offsets[j]);
+		}
+	}
+	CHECK(found == count && count > 0);
+	int ack = -1, transfer_stop = -1, task_stop = -1;
+	bool transfer_verified = false, task_verified = false;
+	for (unsigned i = 0; i < starts[0]; i++) {
+		const typeof(m.pre_events[0]) *e = &m.pre_events[i];
+		CHECK(e->kind != 's'); /* First sample precedes FMP and host setup. */
+		if (e->kind == 'w') {
+			CHECK(!e->vendor && (e->off == 0x24 || e->off == 0x20 || e->off == 0x60 || e->off == 0x80));
+			if (e->off == 0x20) { ack = i; }
+			if (e->off == 0x60 && !e->value) { transfer_stop = i; }
+			if (e->off == 0x80 && !e->value) { task_stop = i; }
+		}
+		if (e->kind == 'r' && !e->vendor && e->off == 0x60 && transfer_stop >= 0 && !e->value) {
+			transfer_verified = true;
+		}
+		if (e->kind == 'r' && !e->vendor && e->off == 0x80 && task_stop >= 0 && !e->value) {
+			task_verified = true;
+		}
+	}
+	CHECK(ack >= 0 && transfer_stop > ack && task_stop > transfer_stop && transfer_verified && task_verified);
+	if (count == 2) {
+		CHECK(starts[1] > starts[0] + 10);
+		const typeof(m.pre_events[0]) *e = &m.pre_events[starts[1] - 1];
+		CHECK(e->kind == 'r' && e->vendor && e->off == 0x40 && (e->value & 1));
+	}
+	unsigned after = starts[count - 1] + 10;
+	if (submitted) {
+		CHECK(count == 2 && after + 1 == m.pre_event_count);
+		const typeof(m.pre_events[0]) *e = &m.pre_events[after];
+		CHECK(e->kind == 'w' && !e->vendor && e->off == 0x58 && e->value == 1);
+	} else {
+		/* Failure can only print and hold, not acknowledge, enable,
+		 * perform setup, clear a request, or submit the prepared TUR.
+		 */
+		for (unsigned i = after; i < m.pre_event_count; i++) { CHECK(m.pre_events[i].kind == 'p'); }
+	}
+}
+
+static void boundary_failed(unsigned phase, int error)
+{
+	probe_to_hold();
+	boundary_samples(phase);
+	diagnostic_samples(0);
+	boundary_trace(phase, false);
+	CHECK(m.boundary_fault_sent && su.dead && !su.writable && !m.commands && !m.writes && !m.syncs);
+	CHECK(!ss.cmd_failures && !ss.timeouts && !ss.retries && !m.clears && !m.command_acks);
+	CHECK(ss.last_is == m.boundary_is && ss.is_errors == !!(m.boundary_is & MODEL_IS_ERRORS));
+	CHECK(m.mmio_writes == m.boundary_last_writes && m.cache_ops == 0 && m.maps == 1);
+	CHECK(!m.r[0x20 / 4]); /* The synthetic IS latch cleared after the sampling read. */
+	for (unsigned i = 0; i < 5; i++) { CHECK(!m.r[0x38 / 4 + i]); }
+	if (phase == 1) { CHECK(!m.hce_enables && !m.smcs && !m.vendor_writes && !m.base_writes && !su.host_owned); }
+	else { CHECK(m.smcs == 1 && m.base_writes == 2 && m.nexus_writes == 1 && su.host_owned); }
+	char expected[256];
+	snprintf(expected, sizeof(expected), "probe FAILED (%d), writes 0, commands failed 0", error);
+	CHECK(occurrences(expected) == 1 && occurrences(" STOP\n") == 1 && occurrences("PROBE HOLD") == 1);
+	snprintf(expected, sizeof(expected), "boundary UIC PA %08x DL %08x NL %08x TL %08x DME %08x",
+	    m.boundary_uic[0], m.boundary_uic[1], m.boundary_uic[2], m.boundary_uic[3], m.boundary_uic[4]);
+	CHECK(occurrences(expected) >= 1);
+
+	/* A test-owned longjmp exits the nonreturning hold before init_error
+	 * is assigned. The cached attempt plus permanent su.dead must still
+	 * forbid later MMIO and DMA reuse, even after controller-side changes.
+	 */
+	unsigned accesses = m.mmio_reads + m.mmio_writes, events = m.pre_event_count;
+	size_t console_size = m.console_size;
+	memset(m.dma + 0x1200, 0x39, 32); /* synthetic late DMA */
+	m.r[0x58 / 4] = m.r[0x78 / 4] = 0;
+	m.r[0x34 / 4] = 1; m.r[0x30 / 4] = 0x10f;
+	uint32_t digest = crc32(0, m.dma, m.size);
+	dev_t dev = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == EIO && !dev && su.attempted);
+	CHECK(ufs_read_capacity() == EIO);
+	uint8_t tur[6] = { 0 };
+	CHECK(ufs_scsi(tur, sizeof(tur), 0, false) == EIO);
+	exynos_ufs_log_boundaries(); /* Per-boot print budget also survives repeated calls. */
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && events == m.pre_event_count);
+	CHECK(console_size == m.console_size && crc32(0, m.dma, m.size) == digest);
+}
+
+static void test_boundaries(void)
+{
+	for (unsigned enabled = 0; enabled < 2; enabled++) {
+		case_name = enabled ? "enabled probe samples pre-enable without restarting HCE" :
+		    "two clean probe boundaries with no print between sample and TUR doorbell";
+		boundary_probe(); m.r[0x34 / 4] = enabled;
+		probe_to_hold();
+		boundary_samples(2); diagnostic_samples(0); boundary_trace(2, true);
+		CHECK(!su.dead && su.host_owned && !su.writable && !m.writes && !m.syncs);
+		CHECK(m.hce_enables == !enabled && m.smcs == 1 && m.commands > 1);
+		CHECK(occurrences("probe PASSED (0), writes 0, commands failed 0") == 1);
+		CHECK(!occurrences(" STOP\n") && m.uic_reads[0] == 2);
+		passed(case_name);
+	}
+
+	static const unsigned error_bits[] = { 2, 7, 11, 12, 16, 17, 18 };
+	static const uint32_t raw_codes[] = { 1, 0x80000000, 0xdeadbeef };
+	for (unsigned phase = 1; phase <= 2; phase++) {
+		case_name = "nonerror IS is retained without blocking either boundary";
+		boundary_probe(); m.boundary_fault = phase; m.boundary_is = 0x400;
+		probe_to_hold();
+		boundary_samples(2); diagnostic_samples(0); boundary_trace(2, true);
+		CHECK(!su.dead && m.commands && !m.writes && !occurrences(" STOP\n"));
+		CHECK(occurrences(phase == 1 ? "boundary pre-enable IS 00000400" : "boundary pre-TUR IS 00000400") == 1);
+		passed(case_name);
+		for (unsigned i = 0; i < sizeof(error_bits) / sizeof(error_bits[0]); i++) {
+			case_name = phase == 1 ? "each sampled IS error stops before enable/FMP" :
+			    "each sampled IS error stops before first TUR doorbell";
+			boundary_probe(); m.boundary_fault = phase; m.boundary_is = 1u << error_bits[i];
+			boundary_failed(phase, EIO);
+			passed(case_name);
+		}
+		for (unsigned layer = 0; layer < 5; layer++) {
+			for (unsigned raw = 0; raw < sizeof(raw_codes) / sizeof(raw_codes[0]); raw++) {
+				case_name = phase == 1 ? "nonzero pre-enable layer code stops even with IS=0 and no valid bit" :
+				    "nonzero pre-TUR layer code stops even with IS=0 and no valid bit";
+				boundary_probe(); m.boundary_fault = phase; m.boundary_uic[layer] = raw_codes[raw];
+				boundary_failed(phase, EIO);
+				passed(case_name);
+			}
+		}
+		for (unsigned task = 0; task < 2; task++) {
+			case_name = "pending transfer/task appearing in a boundary prevents the next action";
+			boundary_probe(); m.boundary_fault = phase;
+			if (task) { m.boundary_tm_dbr = 2; } else { m.boundary_dbr = 4; }
+			boundary_failed(phase, EBUSY);
+			passed(case_name);
+		}
+		for (unsigned bit = 0; bit < 4; bit++) {
+			case_name = "sampled device/list/UIC readiness loss prevents the next action";
+			boundary_probe(); m.boundary_fault = phase; m.boundary_hcs_clear = 1u << bit;
+			boundary_failed(phase, ENXIO);
+			passed(case_name);
+		}
+	}
+
+	case_name = "raw mixed layer codes survive clearing and deferred hold output";
+	boundary_probe(); m.boundary_fault = 2; m.boundary_is = 0x80000404;
+	static const uint32_t codes[] = { 0x80000010, 0x76543210, 0, 0xffffffff, 0x12345678 };
+	memcpy(m.boundary_uic, codes, sizeof(codes));
+	boundary_failed(2, EIO);
+	CHECK(occurrences("boundary pre-enable IS 00000000 HCE 0 HCS 10f DBR 0 TM 0\n") == 1);
+	CHECK(occurrences("boundary pre-TUR IS 80000404 HCE 1 HCS 10f DBR 0 TM 0 STOP\n") == 1);
+	passed(case_name);
+
+	case_name = "already-enabled pre-enable PA indication quarantines without restart";
+	boundary_probe(); m.r[0x34 / 4] = 1; m.boundary_fault = 1; m.boundary_uic[0] = 0x80000010;
+	boundary_failed(1, EIO);
+	passed(case_name);
+
+	case_name = "sampled HCE loss before TUR prevents submission";
+	boundary_probe(); m.boundary_fault = 2; m.boundary_hce_off = true;
+	boundary_failed(2, ENXIO);
+	passed(case_name);
+
+	for (unsigned scan = 0; scan < 2; scan++) {
+		case_name = scan ? "eight-LUN scan samples only the first TUR" : "TUR retries do not repeat pre-submit samples";
+		boundary_probe();
+		if (scan) { m.disks[0].present = false; }
+		else { m.key = 6; m.asc = 0x29; inject(SENSE, 2, 0); }
+		probe_to_hold();
+		boundary_samples(2); diagnostic_samples(0); boundary_trace(2, true);
+		CHECK(!su.dead && !m.writes && m.opcount[0] == (scan ? 8u : 3u));
+		CHECK(ss.retries == (scan ? 0u : 2u) && m.uic_reads[0] == 2);
+		passed(case_name);
+	}
+
+	for (unsigned option = 0; option < 3; option++) {
+		case_name = "absent/zero/non-one ufsprobe leaves Exynos boundary sampling disabled";
+		reset_model(true, 4096); arg("ufsrw", 1);
+		if (option) { arg("ufsprobe", option == 1 ? 0 : 2); }
+		m.r[0x38 / 4] = 0x80000010;
+		dev_t dev = 0;
+		CHECK(sweet_ufs_rootdev(&dev) == 0 && dev && !su.writable && !m.writes);
+		boundary_samples(0); diagnostic_samples(0);
+		CHECK(m.r[0x38 / 4] == 0x80000010);
+		passed(case_name);
+	}
+	case_name = "Qualcomm ufsprobe=1 adds no boundary sampling or hold";
+	reset_model(false, 4096); label(&m.disks[0], "userdata"); arg("ufsprobe", 1); arg("ufsrw", 1);
+	m.r[0x38 / 4] = 0x80000010;
+	dev_t dev = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && dev && su.writable && !m.smcs && !m.vendor_writes);
+	boundary_samples(0); diagnostic_samples(0);
+	passed(case_name);
+
+	for (unsigned early = 0; early < 6; early++) {
+		case_name = "earlier mapping/readiness/pending/list-stop rejection prevents both boundaries";
+		boundary_probe();
+		switch (early) {
+		case 0: m.node_present = false; break;
+		case 1: set_pair("dma-pool", 0, 0); break;
+		case 2: m.r[0x30 / 4] &= ~1u; break;
+		case 3: m.r[0x58 / 4] = 4; break;
+		case 4: m.stop_race = true; break;
+		case 5: m.stop_stuck = true; break;
+		}
+		probe_to_hold();
+		boundary_samples(0); diagnostic_samples(0);
+		CHECK(!m.commands && !m.hce_enables && !m.smcs && !m.writes);
+		passed(case_name);
+	}
 }
 
 static void test_capacity(void)
@@ -1572,6 +1873,7 @@ int main(int argc, char **argv)
 	test_takeover();
 	test_failures();
 	test_diagnostics();
+	test_boundaries();
 	test_capacity();
 	test_gpt();
 	test_handoff();

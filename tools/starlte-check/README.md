@@ -27,7 +27,7 @@ The recorded environment is Linux/x86_64, Clang **23.1.3** and QEMU
   headers/library for `ufs.py` (`-lz`).
 
 The XNU checks need a **fully staged and patched** `xnu-12377.121.6` tree,
-including patches 1131–1134. Default: `research/starlte/xnu`.
+including patches 1131–1135. Default: `research/starlte/xnu`.
 Preparation follows [`xnu.yml`](../../.github/workflows/xnu.yml) /
 [`tools/xnu-local-build.sh`](../xnu-local-build.sh):
 
@@ -208,7 +208,7 @@ device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**161 host scenarios** exercise:
+**236 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
@@ -228,6 +228,20 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
   completion cannot hide a previously observed transport error. Samples read
   only the fixed owned UTRD and response header, never media or hardware-provided
   addresses; neither sample validates completion nor adds link recovery.
+* The exact Exynos + `ufsprobe=1` pre-submit experiment: independent event
+  tracing verifies ten sequential reads after idle/list stop, including
+  already-enabled hosts, and immediately before the first TUR doorbell after
+  raw 512-byte descriptor/Nexus checks. Sampled IS errors or any nonzero
+  layer code stop with EIO, pending DBRs with EBUSY, readiness/pre-TUR HCE loss
+  with ENXIO; all quarantine before further setup/submission. Read-cleared
+  values remain in RAM. Both two-line records print only at the probe hold,
+  never between the final sample and doorbell. Per-boot budgets survive
+  retries/LUN scans/repeated logger calls; absent/zero/non-one probe values
+  and Qualcomm add no boundary sampling. Earlier rejection suppresses samples.
+  A pre-submit failure submits no command, increments no command-failure
+  count, and forbids later MMIO/DMA reuse even after synthetic late DMA.
+  The test-owned `longjmp` leaves the real nonreturning hold before cached
+  `init_error` assignment; later EIO tests cached attempt plus `su.dead`.
 * Capacity/block-size validation, READ CAPACITY(16), READ(16) beyond 32-bit
   LBAs, LUNs 0–7, mixed geometries, strict GPT CRC/geometry/partition bounds,
   exact case-insensitive names and mismatched or missing repeated reads.
@@ -246,7 +260,11 @@ These are software protocol/ownership checks. They do not establish Samsung
 clock/PHY/link state, secure-firmware acceptance, cache/interconnect behavior,
 real DMA access or readable media. Probe 2 physically enabled HCE and observed
 the FMP format call returning zero, but its first TEST UNIT READY timed out with
-UIC_ERROR. The new diagnostic kernel/image still needs a device probe.
+UIC_ERROR. Probe 3 physically recorded first PA `0x80000010`, terminal PA=0,
+IS=4/DBR=1/OCS=0x0f before cleanup; cause/timing remain unclassified. Patch 1135's
+pre-submit experiment is locally validated in `research/starlte/ufs-probe-4-check/`
+and exactly reconstructed in `research/starlte/series-check-ufs-probe-4/`;
+new CI/image and its physical probe remain pending.
 
 ### Reset and final framebuffer: `reset.py`
 

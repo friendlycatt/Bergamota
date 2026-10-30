@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -37,6 +37,8 @@
+  * enable-only attempt, never a blind PHY/link reset. Readiness must survive
+  * enabling. A timed-out Exynos host is never retried or its DMA reused.
+  * ufsprobe=1 holds the final read-only probe result before any root mount.
++ * It also saves two pre-submit UIC boundaries, stopping before the next
++ * setup action/doorbell on a sampled error, including read-cleared codes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -161,6 +163,11 @@
+ _Static_assert(sizeof(struct ufs_prd) == 16, "base PRDT size");
+ _Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "descriptor arena");
+ 
++struct exynos_ufs_boundary {
++	uint32_t is, hce, hcs, dbr, tm_dbr, uic[5];
++	int error;
++};
++
+ static struct {
+ 	vm_offset_t regs;
+ 	vm_offset_t vendor;
+@@ -170,6 +177,9 @@
+ 	uint32_t block_size;
+ 	bool exynos, dma_nc, host_owned, dead;
+ 	bool attempted;
++	bool boundary_probe;                    /* exact Exynos board and ufsprobe=1 */
++	uint8_t boundary_seen, boundary_logged;
++	struct exynos_ufs_boundary boundary[2]; /* retained for this entire boot */
+ 	int init_error;
+ 	uint8_t lun;
+ 	uint8_t tag;
+@@ -308,6 +318,67 @@
+ 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+ }
+ 
++/* starlte-pre-submit-uic-boundaries-v1: each register is read only once
++ * at each boundary. UIC reads may clear latches; persist the raw values
++ * and quarantine before any later setup or submission can hide them.
++ * These sequential observations are not an atomic or passive snapshot.
++ */
++static int
++exynos_ufs_check_boundary(bool before_tur)
++{
++	if (!su.exynos || !su.boundary_probe) { return 0; }
++	if (su.dead) { return EIO; }
++	uint8_t bit = 1u << before_tur;
++	if (su.boundary_seen & bit) { return 0; }
++	struct exynos_ufs_boundary *s = &su.boundary[before_tur];
++	s->is = ufs_rd(REG_IS);
++	s->hce = ufs_rd(REG_HCE);
++	s->hcs = ufs_rd(REG_HCS);
++	s->dbr = ufs_rd(REG_UTRLDBR);
++	s->tm_dbr = ufs_rd(REG_UTMRLDBR);
++	s->uic[0] = ufs_rd(REG_UECPA);
++	s->uic[1] = ufs_rd(REG_UECDL);
++	s->uic[2] = ufs_rd(REG_UECN);
++	s->uic[3] = ufs_rd(REG_UECT);
++	s->uic[4] = ufs_rd(REG_UECDME);
++	su.boundary_seen |= bit;
++	if ((s->is & UFS_IS_ERR_MASK) || s->uic[0] || s->uic[1] ||
++	    s->uic[2] || s->uic[3] || s->uic[4]) {
++		s->error = EIO;
++	} else if (s->dbr || s->tm_dbr) {
++		s->error = EBUSY;
++	} else if ((s->hcs & 0xffu) != HCS_EXYNOS_RDY || (before_tur && !(s->hce & 1u))) {
++		s->error = ENXIO;
++	}
++	if (s->error) {
++		su.dead = true;
++		ss.last_is = s->is;
++		ss.last_hcs = s->hcs;
++		if (s->is & UFS_IS_ERR_MASK) { ss.is_errors++; }
++	}
++	return s->error;
++}
++
++/* Print only at the probe hold, never between the final sample and the
++ * first TUR doorbell. No MMIO or DMA is read here, even after quarantine.
++ * Two two-line records per boot, independent of the pre-cleanup samples.
++ */
++static void
++exynos_ufs_log_boundaries(void)
++{
++	for (unsigned i = 0; i < 2; i++) {
++		uint8_t bit = 1u << i;
++		if (!(su.boundary_seen & bit) || (su.boundary_logged & bit)) { continue; }
++		su.boundary_logged |= bit;
++		const struct exynos_ufs_boundary *s = &su.boundary[i];
++		printf("STARLTE UFS: boundary %s IS %08x HCE %x HCS %x DBR %x TM %x%s\n",
++		    i ? "pre-TUR" : "pre-enable", s->is, s->hce, s->hcs, s->dbr, s->tm_dbr,
++		    s->error ? " STOP" : "");
++		printf("STARLTE UFS: boundary UIC PA %08x DL %08x NL %08x TL %08x DME %08x\n",
++		    s->uic[0], s->uic[1], s->uic[2], s->uic[3], s->uic[4]);
++	}
++}
++
+ /* Samsung ufshci.h/ufshcd_update_uic_error: IS.UIC_ERROR alone cannot
+  * distinguish PA/DL/NL/TL/DME failures. Save the first observed error and
+  * terminal state before UTRLCLR/IS acknowledgement can obscure the evidence.
+@@ -466,6 +537,10 @@
+ 			su.dead = true;
+ 			return EIO;
+ 		}
++		if (cdb[0] == 0x00) {
++			int error = exynos_ufs_check_boundary(true);
++			if (error) { return error; }
++		}
+ 	}
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+@@ -1044,7 +1119,15 @@
+ 		printf("STARLTE UFS: request state changed before enable\n");
+ 		return EBUSY;
+ 	}
+-	if (ufs_rd(REG_IS) & UFS_IS_ERR_MASK) {
++	if (su.boundary_probe) {
++		/* Takeover has already acknowledged IS and stopped both lists.
++		 * Sample enabled hosts too, without re-enabling them.
++		 */
++		int error = exynos_ufs_check_boundary(false);
++		if (error) { return error; }
++		hce = su.boundary[0].hce;
++		hcs = su.boundary[0].hcs;
++	} else if (ufs_rd(REG_IS) & UFS_IS_ERR_MASK) {
+ 		printf("STARLTE UFS: host error after list stop (is 0x%x)\n", ufs_rd(REG_IS));
+ 		return EIO;
+ 	}
+@@ -1538,6 +1621,7 @@
+ 	uint32_t probe = 0;
+ 	PE_parse_boot_argn("ufsprobe", &probe, sizeof(probe));
+ 	if (!su.exynos || probe != 1) { return; }
++	exynos_ufs_log_boundaries();
+ 	printf("STARLTE UFS: probe %s (%d), writes %llu, commands failed %llu\n",
+ 	    error ? "FAILED" : "PASSED", error, ss.writes, ss.cmd_failures);
+ 	printf("STARLTE UFS: PROBE HOLD - photograph this screen, then reboot to recovery\n");
+@@ -1620,6 +1704,9 @@
+ 		su.syncsecs = UFS_SYNC_SECS;
+ 	}
+ 	if (su.exynos) {
++		uint32_t probe = 0;
++		PE_parse_boot_argn("ufsprobe", &probe, sizeof(probe));
++		su.boundary_probe = (probe == 1);
+ 		su.verify = su.fua = su.syncsecs = 0;
+ 		su.cache = su.wait = su.dmasync = false;
+ 		printf("STARLTE UFS: read-only bring-up (ufsrw ignored), scanning LUNs 0..7\n");

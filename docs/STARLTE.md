@@ -11,8 +11,10 @@ TEST UNIT READY still times out: **FAILED (60), writes 0, commands failed 1 /
 PROBE HOLD**. The source/descriptor review is complete; the timeout cause
 and PA indication's timing remain unclassified. The
 [selected next experiment](#selected-next-read-only-experiment) adds bounded
-pre-enable/pre-TUR UIC samples and holds on any sampled error; implementation
-and a new image are pending. **Samsung media reads and an iOS root mount
+pre-enable/pre-TUR UIC samples and holds on any sampled error. Patch 1135 is
+implemented: **236 host scenarios / 24 ADT cases / real-header compile** and
+**278-patch / 6369-file reconstruction PASS**; new CI and image are pending.
+**Samsung media reads and an iOS root mount
 remain unverified**.
 
 [Probe-3 software delivery](#ufs-probe-3-software-delivery) is complete:
@@ -28,8 +30,9 @@ The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The platform and storage work is in
 [`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch),
 [`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch),
-[`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch)
-and [`1134-starlte-ufs-precleanup-diagnostics.patch`](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch),
+[`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch),
+[`1134-starlte-ufs-precleanup-diagnostics.patch`](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch)
+and [`1135-starlte-ufs-presubmit-boundaries.patch`](../xnu/patches-12377/1135-starlte-ufs-presubmit-boundaries.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -322,8 +325,8 @@ translation support.
 | Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| UFS (`ufs.py`) | PASS, 161 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
-| Ordered patch reconstruction | PASS: local four-stage / 277-patch reconstruction, 6369 files and baseline hashes exact; probe-3 CI profile reconstructs all 6374 files with six dxb substitutions and nine prior-reviewed header copies; two documented dxb skips |
+| UFS (`ufs.py`) | PASS, 236 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes deferred pre-submit boundary output |
+| Ordered patch reconstruction | PASS: local four-stage / 278-patch reconstruction, 6369 files and baseline hashes exact; prior probe-3 CI profile reconstructs all 6374 files with six dxb substitutions and nine prior-reviewed header copies; two documented dxb skips |
 | Full XNU26 CI build | PASS, run 41014066730 / 4d12ded; actual ARM64 Mach-O, checksum, pre-cleanup markers and patches 1131–1134 verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
@@ -338,10 +341,12 @@ Patch 1133 is 6172 bytes, SHA256
 `aeb561be8a745543a00dd7216140b45ea49e90bb30a10231c0923709c809c73b`.
 Patch 1134 is 6088 bytes, SHA256
 `ddf2dff41396c6a233a4bf591cca17c32c3ea3224001782ef4dbbeeb712766de`.
+Patch 1135 is 5410 bytes, SHA256
+`e0a8b80e59b9d2f898b589429ed3cf6085c422d24a4df69d32a00cbad68bda47`.
 The reconstruction uses XNU `xnu-12377.121.6` at
 `ac9718fb1af618d5ce8678d0dc6e8a58f252216f` and dxb at
 `663906528d1cd5ea8fde7de6f16de73db9511549`. The latest local reconstruction
-is retained in ignored `research/starlte/series-check-ufs-probe-3/`; the reviewed
+is retained in ignored `research/starlte/series-check-ufs-probe-4/`; the prior reviewed
 CI-profile replay is in
 `research/starlte/ufs-probe-3-bringup/ci-41014066730-source-profile/`.
 The freestanding guests establish component behavior. The full-kernel
@@ -1203,8 +1208,8 @@ These records and the physical evidence remain outside the frozen delivery.
 
 #### Selected next read-only experiment
 
-**`starlte-pre-submit-uic-boundaries-v1` — selected; implementation, local
-validation, CI and image pending.** Keep the current **512-byte UPIU layout**
+**`starlte-pre-submit-uic-boundaries-v1` — implemented and locally validated
+in patch 1135; new CI and image pending.** Keep the current **512-byte UPIU layout**
 to measure whether the indication is already recorded before command submission:
 
 1. After idle/list-stop verification, sample at the existing **pre-enable
@@ -1214,12 +1219,22 @@ to measure whether the indication is already recorded before command submission:
    TUR doorbell**. Both samples record raw **IS/HCE/HCS**, both **DBRs** and
    **PA/DL/NL/TL/DME** from the already mapped standard HCI window.
 
-Allow at most **two new two-line samples per boot**, on the exact Exynos
-read-only probe path, alongside patch 1134's at-most-two six-line samples.
+The exact Exynos identity plus **`ufsprobe=1`** gates this experiment; absent,
+zero or non-one probe values and Qualcomm do not add boundary reads. Persist
+the two raw ten-register samples and their result in **`su.boundary[2]`**, with
+per-boot capture/output masks. Allow at most **two new two-line records per
+boot**, alongside patch 1134's unchanged at-most-two six-line samples.
+**Defer both records to `ufs_probe_hold()`**, reading retained RAM only: no
+console operation intervenes between the final sample and first TUR doorbell.
+TUR retries and LUN scans do not repeat these samples.
+
 Latch all values before any subsequent acknowledgement. A sampled **IS error
-or any nonzero UIC error-code register** must latch failure/quarantine and
-reach the existing hold **before the next setup action/doorbell**; later zeros
-cannot erase the earlier evidence. Keep Image-owned DMA32/Normal-NC, FMP-bypass
+or any nonzero UIC error-code register → EIO**, either sampled pending DBR
+**→ EBUSY**, and sampled readiness loss or pre-TUR HCE loss **→ ENXIO**. Each
+failure permanently quarantines the host and reaches the existing hold
+**before the next setup action/doorbell**; later zeros cannot erase the
+earlier evidence. A pre-submit rejection correctly reports **zero submitted
+commands failed**, not a TUR timeout. Keep Image-owned DMA32/Normal-NC, FMP-bypass
 descriptors, pending-request checks, the five-second deadline/bounded positive-bit
 clear, permanent quarantine, cached failures and pre-BSD/root hold. Exynos
 remains read-only even with `ufsrw=1`. Add no reset/link/PHY/clock operation,
@@ -1233,12 +1248,31 @@ are not atomic or passive. A first-boundary indication predates the later TUR;
 a new second-boundary indication narrows it to setup; one first seen while TUR
 is pending narrows it to after the final boundary, without proving command causality.
 
-Required before a new CI build: fresh host MMIO sequencing/read-clear/error
-latching checks, no doorbell after pre-submit failure, bounded output, cached
-failure/late-DMA quarantine and Qualcomm regressions; full real-header compilation
-and additive-patch reconstruction. Continue reconciling every actual CI source
-file against independently fixed expectations and prior-reviewed header pins.
-Root preparation still awaits measured capacity/GPT and repeated userdata reads.
+Fresh local validation **exits 0**, **13:49:56–13:50:02Z**: **236 host scenarios /
+24 ADT cases / fatal ASan/UBSan / complete real-header Mach-O compile PASS**;
+compiler log empty. The 75 added scenarios independently trace all ten reads,
+raw 512-byte TUR descriptors, no setup/submission after rejection, read-clear
+IS/layer faults, readiness/pending races, output budgets, retries/scans,
+cached failure/late DMA, probe-value gates and Qualcomm regressions. The host
+hold uses a test-owned `longjmp` before `su.init_error` assignment; subsequent
+EIO checks the cached attempt plus `su.dead`, not a return from the real hold.
+Exact tested inputs and results remain in ignored **`ufs-probe-4-check/`**.
+Driver SHA256 **`52bb54cdfc90892dcda38ccff5d7071c81ec6a74d5ee210115dee68bb04096c5`**.
+
+One-shot **`export_check.py` exits 0**, **13:54:37Z**: exact GNU-diff bytes,
+reverse check against the prepared tree and isolated forward application
+match; all **1108 protected hashes** are unchanged. Fresh full reconstruction
+**exits 0**, **13:58:38–13:58:59Z**, **four staging scripts / 278 patches /
+6369 source files exact**, all 15 historical baseline checks, only the two
+documented dxb skips. Command/log/result records are in
+**`research/starlte/ufs-probe-4-bringup/`**, reconstruction summary/log/inventory
+in **`research/starlte/series-check-ufs-probe-4/`**. No new CI, image or phone
+operation at this milestone; these software checks do not establish physical
+Samsung acceptance or the cause of the prior timeout.
+
+Continue reconciling every actual CI source file against independently fixed
+expectations and prior-reviewed header pins. Root preparation still awaits
+measured capacity/GPT and repeated userdata reads.
 
 ## Getting-started guide review for S9
 
@@ -1248,7 +1282,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1134, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1135, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics, **41014066730** predates pre-submit boundaries. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
