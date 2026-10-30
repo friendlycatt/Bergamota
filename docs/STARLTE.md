@@ -1,24 +1,27 @@
 # Galaxy S9 / Exynos9810 bring-up
 
-Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F-class hardware),
+Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F / G960FD),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-29:** the [UFS probe 1 photograph](#photographed-ufs-probe-1-result)
-shows physical XNU reaching Samsung UFS initialization and accepting the DMA
-handoff, then **`host not ready (hce 0x0 hcs 0x10f)` / FAILED (6) / PROBE HOLD**.
-It stops before FMP setup or storage commands. The [read-only UFS path](#read-only-samsung-ufs)
-passes local transport, DMA-handoff and compilation checks; the probe-1 Intel-host
-kernel build and audited full-kernel QEMU failure hold succeeded. Samsung storage
-reads and an iOS root mount are not established. The physical
+**Status, 2026-10-30:** [UFS probe 2](#ufs-probe-2-software-delivery) is finalized
+and independently verified, ready for the phone test. Intel XNU26 CI
+**40955206538** succeeded; all **148 manifest entries / 149 archive files** match.
+Its bounded HCE enable-only correction addresses the
+[probe-1 photograph](#photographed-ufs-probe-1-result): physical XNU accepted the
+DMA handoff, then stopped at **`host not ready (hce 0x0 hcs 0x10f)` / FAILED (6) /
+PROBE HOLD**, before FMP setup or storage commands. Local transport/compilation
+checks and the audited QEMU failure hold pass; **Samsung media reads and an iOS
+root mount remain unverified**. The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
 
 The port reuses Heartwood, Renegade's arm64e/PAC rewriting, and the kernel PAC
 fallback in patch 1019. The platform and storage work is in
-[`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch)
-and [`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch),
+[`1131-starlte-exynos9810-bringup.patch`](../xnu/patches-12377/1131-starlte-exynos9810-bringup.patch),
+[`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch)
+and [`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -298,7 +301,7 @@ Commands, prerequisites, exact test boundaries and output files:
 Tested tools: Clang 23.1.3 and QEMU 11.1.2, using `cortex-a76` for 16 KiB
 translation support.
 
-| Check | Result on 2026-10-29 |
+| Check | Observed result |
 | --- | --- |
 | Interrupt guest (`check.py`) | PASS, GICv2/v3 × 1/8 CPUs; 32 timer IRQs per CPU, 4/200 SGIs per case; ELF/Mach-O compilation and host payload checks |
 | Enxerto host (`enxerto.py`) | PASS, 12 cases: three boards × 608/1024-byte ABI × payload v1/v2; real producer, loader, FDT parser and inflater |
@@ -311,22 +314,26 @@ translation support.
 | Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| UFS (`ufs.py`) | PASS, 93 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
-| Ordered patch reconstruction | PASS: four staging scripts, 275 applied patches, two documented dxb skips; all 6369 source files, 14 pre-1131 hashes and the pre-1132 UFS baseline match |
-| Full XNU26 CI build | PASS, run 40826795487; actual ARM64 Mach-O and patch 1131 markers verified |
-| Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43761664 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
+| UFS (`ufs.py`) | PASS, 135 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation |
+| Ordered patch reconstruction | PASS: local four-stage / 276-patch reconstruction, 6369 files and baseline hashes exact; reviewed CI profile adds six dxb substitutions and real KDK staging, 6374 files exact; two documented dxb skips |
+| Full XNU26 CI build | PASS, run 40955206538; actual ARM64 Mach-O, checksum, HCE markers and patches 1131–1133 verified |
+| Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
-| Full-kernel QEMU | VM/CPU/IOKit initialization observed, 1/1 CPU and SGI1 verified; readable verbose screenshot; framebuffer-only decoder exits 3 (details below) |
+| Full-kernel QEMU | Probe-2 checker 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 7055 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
 | Renegade platform/root preview | PASS, 24 tests and one macOS-only signer-parity skip; includes ios18/ios26 × Linux/macOS full previews before downloads |
 
 Patch 1131 is 25669 bytes across 12 files, SHA256
 `cac36bd98fc5ed6c1c6cab7de24bddc069fc62cf16f705d073a9920374c890bf`.
 Patch 1132 is 34532 bytes for `bsd/dev/sweet_ufs.c`, SHA256
 `6ee211f1f329c2f572dde7cc614780227da45b11e21bdaf9dfed9299164587a6`.
+Patch 1133 is 6172 bytes, SHA256
+`aeb561be8a745543a00dd7216140b45ea49e90bb30a10231c0923709c809c73b`.
 The reconstruction uses XNU `xnu-12377.121.6` at
 `ac9718fb1af618d5ce8678d0dc6e8a58f252216f` and dxb at
-`663906528d1cd5ea8fde7de6f16de73db9511549`. The latest complete reconstruction
-is retained in ignored `research/starlte/series-check-ufs/`.
+`663906528d1cd5ea8fde7de6f16de73db9511549`. The latest local reconstruction
+is retained in ignored `research/starlte/series-check-ufs-probe-2/`; the reviewed
+CI-profile replay is in
+`research/starlte/ufs-probe-2-bringup/ci-40955206538-source-profile-v2/`.
 The freestanding guests establish component behavior. The full-kernel
 observations below extend this to QEMU startup execution. The physical
 probe establishes Enxerto entry and visible panel refresh. The later user
@@ -595,6 +602,14 @@ The workflow now offers the standard Intel build-host fallback
 [`runner_arch=intel`](CI_CACHE.md#macos-26-runner-capacity-fallback), without
 changing the ARM64 kernel target or patch series.
 
+**Late watcher follow-up, 2026-10-30T04:25Z:** the old arm64 retry watch ended
+on a network timeout; a later status query also reported a connectivity error.
+Fresh read-only `gh run view` succeeds: **40916280553** is still **queued**,
+with **no current jobs or conclusion**, while probe-2 **40955206538** remains
+**completed/success**. The network failure did not establish a kernel failure.
+Original logs and the fresh queries are retained separately in
+`research/starlte/ufs-probe-2-bringup/ci-40916280553-late-watcher-review/`.
+
 ### Read-only UFS probe 1 image
 
 **Delivered and subsequently photographed on the phone:**
@@ -732,23 +747,113 @@ All 61 original probe-1 source hashes and its image/archive checksums remain
 unchanged. The correction is committed/pushed as
 **`f359612c182a30f27071210b7baa25986b1fe08f`**. Fresh Intel-host XNU26
 [CI 40955206538](https://github.com/friendlycatt/Bergamota/actions/runs/40955206538)
-is **in progress** (26.5 / DEVELOPMENT / SWEET, Xcode 26.1, Intel runner);
-its kernel artifact and the separate probe-2 image remain pending.
+is **SUCCESS**, completed **2026-10-29T21:53:15Z** (26.5 / DEVELOPMENT / SWEET;
+**41m 12s Build / 44m 42s total**, x86_64 / Xcode **26.1.1 / 17B100**).
+Both kernel/build-tree downloads completed; the strict source inspection failed
+on **eight changed / five additional files**, with no missing files and the actual
+CI UFS driver matching the tested source. The four build-file deltas match pinned
+dxb substitutions; the remaining files reflect CI's real **KDK 26.5 / 25F71** V2
+headers and **MacOSX26.1.sdk** TargetConditionals instead of local stubs/older SDK.
+The original failure and every delta are preserved locally. A separately replayed
+reviewed CI profile now passes: **6374/6374 exact source files**, **six pinned dxb
+substitutions / five staging scripts / 276 patches**, no missing/different/extra
+files or exclusions. All nine external header copies are individually byte/hash
+pinned to the reviewed CI inputs; this does not claim an independent Apple
+SDK/KDK reinstall or a byte-identical kernel rebuild. The initial replay's
+incorrect full-build stage selection and its failed result also remain preserved.
+Fresh inspection passes ARM64/checksum/HCE diagnostics/empty errors and the full
+patch order: kernel **22213456 bytes**, SHA256
+**`c4350d0f7d3d15312cdaadfb9c9f9a15f7bbd624085946d69b907d0466d45765`**.
+The separate probe-2 image and fresh real-kernel QEMU check are complete as
+recorded below. No download remains active and no new CI run was dispatched for
+source reconciliation.
 
 **Probe-2 preparation:** separate ignored `research/starlte/ufs-probe-2-delivery/`
 now holds the unchanged checked Image/ELF and fresh hardware/QEMU ADTs.
 The DMA/Image properties remain runtime-filled placeholders, not historic
 phone addresses. All **351 loader/producer/check-tool/patch/staging/workflow
 source hashes** match f359612; **158 protected probe-1 files** are unchanged.
-Nine reproduction-script syntax checks and **18 delivery-guard tests** pass.
-Synthetic finalizer/archive and old-kernel host-loader smoke also pass; these
-are **format/plumbing tests, not new-kernel or Samsung HCE/DMA execution**.
+Initial preparation passed nine reproduction-script syntax checks and **18
+delivery-guard tests**; the reviewed CI-profile revision passes **ten syntax
+checks / 23 unittest methods with adversarial subtests**. Fresh synthetic
+finalizer/archive integration passes **eight negative guards / 118 fixture
+manifest files / exact hashes**, explicitly mocking only the old binary's kernel
+marker guard for format testing. The old binary is rejected by the real guard.
+Old-kernel host-loader smoke also passes; these are **format/plumbing tests, not
+new-kernel or Samsung HCE/DMA execution**.
 Fresh ADTs intentionally carry fresh 256-byte random seeds; an initial smoke
 comparison's false byte-identity assumption is preserved as a failure, and its
 fixed fixture comparison normalizes only the seed without changing real ADTs.
 Actual packaging requires the successful fresh CI kernel, HCE diagnostic
 markers and the tested driver hash in its downloaded patched build tree.
-Preparation/packaging JSON will remain separate from finalized records.
+Preparation/packaging JSON remain separate from finalized records.
+
+### UFS probe 2 software delivery
+
+**Ready test image:** `enxerto/out/starlte/boot-starlte-ufs-probe-2.img`,
+**10459152 bytes**, SHA256
+**`f8e7b3cbffd09a96e372d0267a19a247cd9365007e61df97295789c485b69bb3`**,
+with adjacent `.img.sha256`. Hardware payload: **8410336 bytes**,
+**`5d5632f08a3c1b55a6de25dd928dc757df2eb6cd679c82a32216146141a6c5bc`**.
+The unchanged checked Enxerto Image is Samsung's kernel section; the SWEETXNU
+payload is its ramdisk section, **not an iOS root filesystem**.
+
+Actual packaging exits **0**. Complete production host-loader execution compares
+**43778048 RAM bytes exact**, with dirty segment/ADT/boot_args destinations and
+unchanged source payload; host-owned MMU/UI/jump services do not execute XNU.
+The independent raw Samsung audit passes metadata, sizes, sections, legacy SHA-1,
+unchanged second/DTBH/footer and standalone checksum. Both hardware/QEMU payloads'
+**ten loaded kernel segments exactly match fresh CI Mach-O bytes**, including
+bounded DEFLATE decoding and entry/memory bounds; neither contains a root RAMDisk.
+Hardware RAM is `0x880000000 + 0x80000000`; QEMU RAM is
+`0x50000000 + 0x60000000`, matching both ADTs and the generator.
+
+Two auditor-only mistakes remain preserved as failures: the checkpoint-carried
+stdin check guessed a different QEMU RAM window, and a first expanded check
+applied loaded-segment size rules to nonloaded `__CTF` debug data. The original
+stdin failure is distinguished from its saved read-only reproduction; corrected
+audit **v2 exits 0**. No correction repackaged or changed the delivered image.
+
+**Fresh real-kernel QEMU:** `ufs-probe-2-qemu-40955206538/`, **90 seconds**,
+checker **0**, **7078 complete console bytes**, **7055 IRQs + one independently
+verified same-PC-retried Skywalk demand fault**; no unexpected exceptions.
+Fault: **ESR `0x96000046`**, **FAR `0xfffffe36107c0000`** (printed pageable-map
+start), **ELR/retry `0xfffffe0007803c50`**, `_skmem_sysctl_init + 0x2c`, exact
+`mov w8,#3; str w8,[x0]` bytes in both CI kernel and payload. Raw capture addresses,
+ring, root/panic flags and CI source references are independently checked.
+`rootvnode=0`, `early_panicking=0`, snapshot `_cpu_idle + 0x220`.
+
+The separately viewed `fb.png` visibly shows **FAILED (6), writes 0, commands
+failed 0 / PROBE HOLD**. Underlying runner remains **3 / blank_screen** because
+the white-font decoder misses the readable coloured console. QEMU has **no
+Samsung UFS host** and only checks missing-node failure before MMIO; it never
+executes the new HCE path, FMP or storage commands. This is not a Samsung read,
+root mount or userspace boot.
+
+**Finalized bundle:** `enxerto/out/starlte/starlte-ufs-probe-2-40955206538.tar.gz`,
+**30657282 bytes**, SHA256
+**`be7c8247ffdb598925a954d867e88f822eb2475bdac6c774a959344654973714`**,
+with adjacent `.gz.sha256`. Actual finalization with the reviewed fresh QEMU
+capture exits **0**. Independent final verification passes all **148 manifest entries / 149
+archive files**, standalone image/archive checksums, CI/source provenance and
+failure preservation. All **351 source / 158 protected probe-1 hashes** match;
+all **153 checked delivery/output paths** are ignored by git.
+
+The frozen `research/starlte/ufs-probe-2-delivery/` includes raw-image/QEMU
+reviews, source-profile evidence and the preserved failed records. Original
+`source.json` / `delivery.json` retain preparation/packaging; separate
+`source-final.json` / `delivery-final.json` record completion. The late independent
+manifest/archive auditor and its passing review stay outside the completed
+bundle, under `research/starlte/ufs-probe-2-bringup/`:
+`independent-audit/delivery.py` and
+`ci-40955206538-delivery-independent-review.json`. Delivery bytes are unchanged.
+
+Use the selected **TWRP / OrangeFox** test-image route. Photograph the **whole
+screen**, including inherited host state, **HCE enable-only attempt/result**,
+FMP, LUN/capacity, GPT/repeated sample, write/failure counters and **PROBE HOLD**.
+If it stalls earlier, capture the last visible line. The next result is this
+physical test; Samsung media reads remain the prerequisite for preparing the
+iOS26 root. No assistant phone writes or Apple root downloads occurred.
 
 ## Getting-started guide review for S9
 
@@ -814,11 +919,10 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Correct the photographed HCE readiness
-   rejection with a source-justified, bounded Exynos enable-only path; validate,
-   rebuild and deliver probe 2. Obtain actual LUN capacity/GPT and repeated
-   userdata reads before preparing the iOS26 root. A userdata write needs
-   explicit confirmation.
+1. **Read-only Samsung storage.** Test the finalized
+   [probe-2 image](#ufs-probe-2-software-delivery) and capture the bounded HCE
+   enable-only result. Obtain actual LUN capacity/GPT and repeated userdata reads
+   before preparing the iOS26 root. A userdata write needs explicit confirmation.
 2. **Complete the physical XNU record.** The probe-1 photograph establishes
    XNU UFS initialization/failure hold, not a root mount or userland boot.
    Capture whole-screen results of subsequent tests, including the last visible
