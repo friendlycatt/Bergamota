@@ -9,8 +9,8 @@ shows the bounded **HCE enable succeeded** (`HCE=1`, `HCS=0x10f`, `IS=0`) and
 the **FMP format call returned 0**. The first TEST UNIT READY command then
 **timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
 The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
-delivery/guard scripts are validated; Intel CI **41014066730** is dispatched,
-but its compiler result and new image are not available yet.
+delivery/guard scripts are validated; Intel CI **41014066730** succeeded on
+**4d12ded**. Fresh artifact reconciliation and image audits remain pending.
 **Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
@@ -949,9 +949,18 @@ dxb skips. Implementation **`4d12ded8d3b18048e8e5e8f685a997c8a1983f59`** and
 the physical-observation commit **`de43bcb`** are pushed. Explicit Intel build
 [41014066730](https://github.com/friendlycatt/Bergamota/actions/runs/41014066730)
 uses **26.5 / DEVELOPMENT / SWEET / Xcode 26.1 / use_kdk=true / keep_going=true**,
-source **4d12ded**, job **123926261213**, **queued at dispatch**. A retained
-completion watcher saves metadata/actions/artifact evidence; no compiler result
-or probe-3 image is available yet. The current phone result remains probe 2's timeout.
+source **4d12ded**, job **123926261213**, initially queued at dispatch. The retained
+watcher now exits **0**: **SUCCESS**, attempt **1**, job completed
+**2026-10-30T07:11:15Z**, run updated **07:11:16Z**. Exact durations are
+**41m 12s Build / 44m 52s job / 45m 02s dispatch-to-job-completion**. Actions confirm
+**x86_64 / Xcode 26.1.1 / 17B100**, actual host macOS **26.6.1 / 25G76**; the kernel
+target remains **26.5 / DEVELOPMENT / SWEET**. The error summary has **zero lines
+in errors.txt / no failed objects**; raw `error:` substrings include expected
+patch-check skips and interleaved warnings, not all compiler failures.
+Artifacts **xnu-kernel 12960019646 / 174382572 ZIP bytes** and
+**xnu-buildtree 12960388132 / 30964317 ZIP bytes** are unexpired. Fresh downloads,
+complete source-profile replay and actual kernel inspection are active; no
+probe-3 image is available yet. The current phone result remains probe 2's timeout.
 
 Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
 new source/run/output paths and refuses existing one-shot outputs. The prepared
