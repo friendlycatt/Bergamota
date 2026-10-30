@@ -4,12 +4,14 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F / G960FD),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-30:** the [probe-3 photograph](#photographed-ufs-probe-3-result)
-shows first **PA `0x80000010`**, then **PA=0**, with both pre-cleanup samples
-reporting **IS=4 / HCE=1 / HCS=0x10f / DBR 1->1 / OCS=0x0f**. The first
-TEST UNIT READY still times out: **FAILED (60), writes 0, commands failed 1 /
-PROBE HOLD**. The source/descriptor review is complete; the timeout cause
-and PA indication's timing remain unclassified. The active
+**Status, 2026-10-30:** the new [startup-candidate photograph](#photographed-startup-candidate-result)
+stops **before HCE enable**, with **IS=0 / HCE=0 / HCS=0x10f / idle DBRs /
+PA=`0x80000010` / other layers zero**: **FAILED (5), writes 0, commands failed 0 /
+PROBE HOLD**. This pre-enable EIO is not another measured TUR timeout.
+The earlier [probe-3 photograph](#photographed-ufs-probe-3-result) remains the
+TUR comparison: **FAILED (60), commands failed 1**, PA **`0x80000010 -> 0`**,
+pending DBR and initializer OCS. The indication's timing/clearing mechanism
+and physical timeout cause remain unclassified. The active
 [startup/NOP candidate](#opt-in-link-startup-and-nop-candidate), patch **1136**
 on `starlte/ufs-link-startup`, addresses the missing post-HCE transport sequence:
 **329 host scenarios / 24 ADT cases / real-header compile** and
@@ -18,7 +20,11 @@ on `starlte/ufs-link-startup`, addresses the missing post-HCE transport sequence
 completed successfully on attempt 1. All **6374 pre-fixed CI source hashes**
 and the actual kernel verify. The **10463248-byte startup/NOP image** is packaged,
 independently raw-audited and finalized. The corrected QEMU audit verifies the
-expected missing-node hold; **the image is ready for the S9 test photograph**.
+expected missing-node hold. Its physical result exposes an overly strict
+startup guard; the [narrowly gated clearing correction](#narrow-pre-hce-linereset-correction)
+in additive patch **1137** passes **501 host / 24 ADT / fatal sanitizers /
+real-header compilation / 280-patch / 6369-file reconstruction**. Commit/push
+and a replacement CI image remain next; UIC/NOP/TUR stay strict.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
 **Samsung media reads and an iOS root mount
@@ -39,8 +45,9 @@ fallback in patch 1019. The platform and storage work is in
 [`1132-starlte-readonly-ufs.patch`](../xnu/patches-12377/1132-starlte-readonly-ufs.patch),
 [`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch),
 [`1134-starlte-ufs-precleanup-diagnostics.patch`](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch),
-[`1135-starlte-ufs-presubmit-boundaries.patch`](../xnu/patches-12377/1135-starlte-ufs-presubmit-boundaries.patch)
-and [`1136-starlte-ufs-link-startup.patch`](../xnu/patches-12377/1136-starlte-ufs-link-startup.patch),
+[`1135-starlte-ufs-presubmit-boundaries.patch`](../xnu/patches-12377/1135-starlte-ufs-presubmit-boundaries.patch),
+[`1136-starlte-ufs-link-startup.patch`](../xnu/patches-12377/1136-starlte-ufs-link-startup.patch)
+and [`1137-starlte-ufs-preenable-linereset.patch`](../xnu/patches-12377/1137-starlte-ufs-preenable-linereset.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -333,9 +340,9 @@ translation support.
 | Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| UFS (`ufs.py`) | PASS, 329 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP and deferred boundary output |
-| Ordered patch reconstruction | PASS: candidate four-stage / 279-patch reconstruction, 6369 files and baseline hashes exact; first attempt stopped on BearSSL DNS failure before patching; prior probe-3 CI profile reconstructs all 6374 files with six dxb substitutions and nine prior-reviewed header copies; two documented dxb skips |
-| Full XNU26 CI build | PASS, run 41014066730 / 4d12ded; actual ARM64 Mach-O, checksum, pre-cleanup markers and patches 1131–1134 verified |
+| UFS (`ufs.py`) | PASS, 501 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing and deferred boundary output |
+| Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; frozen startup CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
+| Full XNU26 CI build | PASS, run 41092452347 / ec7a619; actual ARM64 Mach-O, checksum, startup/NOP markers and patches 1131–1136 verified; patch 1137 not built yet |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
 | Full-kernel QEMU | Probe-3 checker and corrected independent audit 0 after 90 seconds: expected missing-node FAILED/PROBE HOLD, 7078 console bytes, 6920 IRQs and one verified retried Skywalk fault; framebuffer-only decoder exits 3; Samsung UFS not modeled |
@@ -1329,7 +1336,8 @@ on **`starlte/ufs-link-startup`**, based on **2347574**, fills that source gap:
 The candidate command line adds `ufslinkinit=1` to the read-only probe arguments
 above. Useful physical evidence is the **UIC command/result/setup** lines,
 **warm link started/inherited**, **NOP IN result**, then TUR/capacity/GPT/read
-results and **PROBE HOLD**. This sequence has not run on the phone yet.
+results and **PROBE HOLD**. The new photograph stops before this sequence;
+LINKSTARTUP/NOP/TUR acceptance is still untested.
 
 Local validation **16:21:28–16:21:33Z** passed **329 host / 24 ADT / fatal
 ASan/UBSan / complete real-header compilation**. Its model invalidates transport
@@ -1405,7 +1413,7 @@ Actual **`finish_delivery.py`** completed successfully **18:04:42Z**.
 `SHA256SUMS`**, manifest SHA256
 **`1ba06e42b359f9c1a96721770248a375f4e52c1bd063c22498337fc63e889b2a`**.
 The final receipt supersedes initial packaging status in `delivery.json`.
-The ready-to-test image is:
+The delivered candidate image is:
 
 ```text
 /home/friendlycatt/Bergamota/research/starlte/ufs-link-startup-work/enxerto/out/starlte/boot-starlte-ufs-link-startup.img
@@ -1415,7 +1423,94 @@ Use the existing **TWRP / OrangeFox** Samsung boot-image procedure. Photograph
 the complete held UFS output, especially **warm-link/UIC, NOP result, boundaries,
 capacity/GPT/read CRC and final counters**. If it stops earlier, capture the last
 visible line. Measured Samsung capacity/GPT and repeated userdata reads are
-required before root preparation.
+required before root preparation. Its subsequent physical stop is documented below;
+keep this completed delivery frozen when preparing a replacement.
+
+#### Photographed startup-candidate result
+
+The actual user JPEG **`5992549563971080512.jpg`** and labeled nearest-neighbor
+crop were directly viewed. The same photograph was sent twice, not two measured
+boots. Qualified manual transcription is retained in ignored
+**`research/starlte/device-ufs-link-startup/observation.json`**; original
+**204261 bytes**, SHA256
+**`297d9964c8706807e97773f0c8c2664e5843b904aa194dbfc7502a006f8d52e0`**.
+The photograph follows candidate delivery, but no installed-image checksum or
+displayed startup command line independently establishes exact image identity.
+
+```text
+STARLTE UFS: boundary pre-enable IS 00000000 HCE 0 HCS 10f DBR 0 TM 0 STOP
+STARLTE UFS: boundary UIC PA 80000010 DL 00000000 NL 00000000 TL 00000000 DME 00000000
+STARLTE UFS: probe FAILED (5), writes 0, commands failed 0
+STARLTE UFS: PROBE HOLD - photograph this screen, then reboot to recovery
+```
+
+In the matching **ec7a619** source, `exynos_ufs_check_boundary(0)` rejects the
+nonzero PA register with **EIO**, before clock controls, HCE enable, local CPort
+SETs, LINKSTARTUP, NOP or SCSI. The boundary follows takeover IS acknowledgement
+and list stop; it is not untouched bootloader entry. These ten sequential reads
+are not an atomic/passive snapshot. Samsung defines PA valid/mask, and pinned
+[Linux v6.6][linux66-ufshci]:235–236, [core driver][linux66-ufshcd]:6592–6605
+names generic bit `0x10` **LINERESET**. Linux also explicitly reads UECPA to
+clear a LINK_STARTUP indication (4897–4898), but this photo does not measure
+when the indication arose, whether it cleared on this read or whether it recurs.
+
+Visible runtime DMA **`0x801a8000+0x104000`** ends at **`0x802ac000`**, inside
+Image mapping **`0x80104000+0x1ac000`**, ending at **`0x802b0000`**. CAP
+**`0x1303ff0f`**, VER **`0x210`**, initial transfer/task RSR **1/1**, TX/RX
+**`0xc/0xc`**, Nexus **`0xffff`**, SWRST **0**, GPIO **1**, CLKSTOP **0**, FORCE
+**`0xde0`** remain printed observations, not proof of clock/PHY or DMA acceptance.
+Do not hardcode runtime addresses.
+
+Before edits, **`preenable-linereset-bringup/preserve.py`** verified **355 prior
+source hashes / 60 frozen manifest entries**, and preserved **seven baseline
+snapshots / 6587 protected files**. The preserved original driver reproduces
+this exact pre-enable EIO in one fatal-ASan/UBSan host case, **19:58:10Z**, in
+**`preenable-linereset-bringup/baseline-reproduction-v2/`**. Its first fixture
+compile failed on an unused `cases` counter; the failed script/log/result remain
+separate in **`baseline-reproduction/`**. This reproduction concerns the
+photographed boundary registers, not byte-identical runtime addresses or a
+hardware model of the whole phone.
+
+#### Narrow pre-HCE LINERESET correction
+
+The corrected driver requires exact **`ufsprobe=1 ufslinkinit=1`**, mapped UniPro
+and the original **IS=HCE=0 / ready HCS / idle DBRs / PA=`0x80000010` / other
+layers zero**. Only then does it take one immediate twelve-register confirmation
+in slot 3, after the original unchanged ten-register sample, before clock/HCE
+setup. No polling, acknowledgement, reset, delay or output intervenes.
+
+The confirmation requires **IS=HCE=0 / all layer codes zero / ready HCS / both
+DBRs and both complete RSR values zero**. Any status/layer code causes **EIO**;
+pending/restarted/unknown list state causes **EBUSY**; HCE/readiness change causes
+**ENXIO**. All permanently quarantine before setup/submission. Both raw samples
+remain stored; failed confirmation marks **pre-HCE-clear STOP**, not the original
+slot. The optional two-line **`pre-HCE-clear`** record includes **RSR x/y** and
+prints once from RAM at the hold. UIC/NOP/TUR checks and the separate successful-
+LINKSTARTUP-only allowance are unchanged. A clearing confirmation is a sequential
+observation, not proof of the indication's origin or an atomic hardware state.
+
+Fresh validation **20:04:40–20:04:48Z**, exit **0**: **501 host scenarios / 24
+ADT cases / fatal ASan/UBSan / complete real-header Mach-O compilation PASS**,
+with an empty compiler log. The 172 new scenarios cover isolated clearing,
+persistence/recurrence, every original PA bit-neighbor/IS bit, other layer codes,
+HCE/readiness/list changes, opt-in gates, post-HCE UIC rejection and strict
+pre-NOP/pre-TUR refusal. Exact ten input copies, commands and results are in
+**`research/starlte/preenable-linereset-check-1/`**. Corrected driver SHA256
+**`410d0471474bddc5f8197ec9d9493a75a704aad81f3e2440e34a464bfaf1eede`**;
+all **6587 protected files / seven snapshots / patch 1136** remain unchanged.
+Additive patch **`1137-starlte-ufs-preenable-linereset.patch`**, **6101 bytes /
+`d76fea14c1d80a7dea71751ea25fe151581b2a1dbc63752f746784601fbb9e40`**, passes
+exact GNU-diff export and isolated forward/reverse application **20:12:25Z**.
+Eighteen transport/setup/discovery functions are byte-identical to the baseline.
+Fresh ordered reconstruction passes **20:13:02Z**, **four staging scripts / 280
+patches / 6369 sources exact**, all historical baseline checks and the complete
+**6369-file pre-1137 ec7a619** inventory; only the documented dxb skips.
+Evidence is in **`preenable-linereset-export/` / `series-check-preenable-linereset/`**;
+patch 1136 and the previous completed delivery remain unchanged. Commit/push and
+replacement CI/image are next.
+Physical clearing, startup/NOP/TUR, descriptor/response/data DMA,
+capacity/GPT/repeated userdata reads and root mount remain unverified; no agent
+phone operation occurred.
 
 ## Getting-started guide review for S9
 
@@ -1425,7 +1520,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1136, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics, **41014066730** predates pre-submit boundaries. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1137, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics, **41014066730** predates pre-submit boundaries, **41092452347** predates pre-HCE clearing. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
@@ -1481,14 +1576,16 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Build and physically test the locally validated
-   [startup/NOP candidate](#opt-in-link-startup-and-nop-candidate),
-   using the supplied Samsung template and 512-byte UPIU layout. Obtain actual LUN
+1. **Read-only Samsung storage.** Commit/push and build the locally
+   validated/reconstructed [pre-HCE correction](#narrow-pre-hce-linereset-correction), then
+   package a fresh startup/NOP image using the supplied Samsung template
+   and 512-byte UPIU layout. Keep all transfer checks strict. Obtain actual LUN
    capacity/GPT and repeated userdata reads before preparing the iOS26 root.
    A destructive userdata operation needs separate confirmation; no GPT changes.
 2. **Extend the physical XNU record.** Probe 3's photograph and source review
    are complete: PA `0x80000010 -> 0`, pending DBR and initializer OCS before
-   cleanup, then failure hold. Photograph startup/NOP results, boundary samples,
+   cleanup, then failure hold. The new candidate photograph stops at pre-enable
+   with zero failed submitted commands. Photograph replacement startup/NOP results, boundary samples,
    any first-error/terminal samples, counters and hold (or last visible line).
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the

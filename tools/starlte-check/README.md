@@ -208,7 +208,7 @@ device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**329 host scenarios** exercise:
+**501 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
@@ -226,8 +226,8 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
   receive GET/NOP checks without LINKSTARTUP. Exact opt-in/mapping, masked
   clock controls before/after HCE, each UIC-stage timeout, frozen-counter poll
   bounds, stale/failed acknowledgements and direct/generic result disagreement
-  are exercised. Only the exact PA LINERESET indication accompanying successful
-  completed LINKSTARTUP is permitted; other stages/errors and all transfer
+  are exercised. The exact PA LINERESET indication accompanying successful
+  completed LINKSTARTUP is permitted; other UIC stages/errors and all transfer
   boundaries reject it. Missing/malformed NOP replies, Nexus readback failure,
   pre-NOP readiness loss and late DMA quarantine prevent SCSI. Independent raw
   NOP/TUR bytes select boundary fault injection; tracing extends through NOP to
@@ -245,8 +245,9 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 * The exact Exynos + `ufsprobe=1` pre-submit experiment: independent event
   tracing verifies ten sequential reads after idle/list stop, including
   already-enabled hosts, and immediately before the first TUR doorbell after
-  raw 512-byte descriptor/Nexus checks. Sampled IS errors or any nonzero
-  layer code stop with EIO, pending DBRs with EBUSY, readiness/pre-TUR HCE loss
+  raw 512-byte descriptor/Nexus checks. Sampled IS errors or nonzero
+  layer codes stop with EIO except for the narrow pre-HCE case below;
+  pending DBRs stop with EBUSY, readiness/pre-TUR HCE loss
   with ENXIO; all quarantine before further setup/submission. Read-cleared
   values remain in RAM. Both two-line records print only at the probe hold,
   never between the final sample and doorbell. Per-boot budgets survive
@@ -256,6 +257,19 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
   count, and forbids later MMIO/DMA reuse even after synthetic late DMA.
   The test-owned `longjmp` leaves the real nonreturning hold before cached
   `init_error` assignment; later EIO tests cached attempt plus `su.dead`.
+* The photographed **IS=0 / HCE=0 / PA=`0x80000010`** pre-enable rejection,
+  first reproduced using the preserved uncorrected driver. Only exact
+  `ufsprobe=1 ufslinkinit=1`, mapped UniPro, ready HCS, idle DBRs and zero other
+  layers allow one immediate twelve-register **pre-HCE-clear** confirmation
+  after the original unchanged ten reads. It requires IS=HCE=0, all layer codes
+  zero, ready HCS, both DBRs and both complete RSR values zero, before clock/HCE
+  setup; no polling, acknowledgement, reset, delay or logging intervenes.
+  Persistent/recurrent/read-cleared errors, every original PA bit-neighbor/IS
+  bit, other layers, HCE/readiness/list-state changes and disabled opt-in gates
+  are rejected. Both raw samples survive; failed confirmation marks slot 3 STOP.
+  The optional two-line confirmation prints only once at the hold, from RAM.
+  Later UIC/NOP/TUR errors cannot reuse this allowance. These 172 added scenarios
+  establish bounded software behavior, not the phone's read-clear mechanism.
 * Capacity/block-size validation, READ CAPACITY(16), READ(16) beyond 32-bit
   LBAs, LUNs 0–7, mixed geometries, strict GPT CRC/geometry/partition bounds,
   exact case-insensitive names and mismatched or missing repeated reads.
@@ -276,12 +290,19 @@ real DMA access or readable media. Probe 2 physically enabled HCE and observed
 the FMP format call returning zero, but its first TEST UNIT READY timed out with
 UIC_ERROR. Probe 3 physically recorded first PA `0x80000010`, terminal PA=0,
 IS=4/DBR=1/OCS=0x0f before cleanup; cause/timing remain unclassified. The startup
-candidate is validated in the `starlte/ufs-link-startup` worktree's
-`research/starlte/link-startup-check-1/` and exactly reconstructed in
-`research/starlte/series-check-link-startup-retry1/` (279 patches / 6369 files).
-The first reconstruction's BearSSL DNS failure is retained separately. These
-checks model transport behavior; a candidate CI image and physical result are
-still required. Main-checkout probe 4 remains pinned to source `2347574`.
+candidate's **ec7a619 / CI 41092452347** image was delivered and its photograph
+stops at pre-enable **FAILED (5), writes 0, commands failed 0**, before startup.
+The frozen original checks/reconstruction remain in `link-startup-check-1/`
+and `series-check-link-startup-retry1/` (329 cases / 279 patches / 6369 files),
+including the separately retained first reconstruction's BearSSL DNS failure.
+The pre-enable correction passes **501/24** in the worktree's
+`research/starlte/preenable-linereset-check-1/`, with exact input copies, fatal
+sanitizers and complete real-header compilation. Additive patch 1137 passes
+forward/reverse application and fresh reconstruction in
+`research/starlte/series-check-preenable-linereset/` (**280 patches / 6369 files**),
+including the full pre-1137 baseline inventory. Commit/push and a replacement
+CI image/physical test remain next. Main-checkout probe 4 remains
+pinned to source `2347574`; physical Samsung media reads/root mount are unverified.
 
 ### Reset and final framebuffer: `reset.py`
 

@@ -191,6 +191,14 @@ struct model {
 	bool corrupt_on_clear, corrupt_on_ack;
 	bool trace_boundaries, trace_through_nop, lists_stopped, boundary_fault_sent, boundary_is_read_clear;
 	bool boundary_hce_off;
+	/* Inject a fresh state after the first layer sample, before any HCE
+	 * enable. These read-clear/persistence controls are independent inputs.
+	 */
+	bool clear_fault, clear_fault_sent, clear_is_read_clear, late_boundary_sent;
+	uint32_t clear_is, clear_uic[5], clear_hce, clear_hcs_clear, clear_hcs_set;
+	uint32_t clear_dbr, clear_tm_dbr, clear_rsr, clear_tm_rsr;
+	uint32_t hce_uic[5], late_boundary_is, late_boundary_uic[5];
+	unsigned late_boundary;
 	/* Opt-in controller model: HCE invalidates the link independently of
 	 * its HCS bits; UIC startup and an actual NOP reply restore transport.
 	 * These controls are test inputs, not the production driver's state.
@@ -606,6 +614,9 @@ static void model_enable_progress(void)
 	m.r[0x78 / 4] = m.hce_tm_dbr;
 	m.r[0x60 / 4] = m.hce_rsr;
 	m.r[0x80 / 4] = m.hce_tm_rsr;
+	for (unsigned i = 0; i < 5; i++) {
+		if (m.hce_uic[i]) { m.r[0x38 / 4 + i] = m.hce_uic[i]; }
+	}
 	if (m.startup_model) {
 		m.link_live = m.device_ready = false;
 		memset(m.local_attrs, 0, sizeof(m.local_attrs));
@@ -668,6 +679,11 @@ static void model_boundary_progress(uint32_t off, bool vendor)
 		for (unsigned i = 0; i < 512; i++) { CHECK(m.dma[0x1200 + i] == 0); }
 	}
 	unsigned phase = m.nexus_writes ? (m.dma[0x1000] == 0 ? 3u : 2u) : 1u;
+	if (m.boundary_fault_sent && m.late_boundary == phase && !m.late_boundary_sent) {
+		m.late_boundary_sent = true;
+		m.r[0x20 / 4] |= m.late_boundary_is;
+		for (unsigned i = 0; i < 5; i++) { m.r[0x38 / 4 + i] = m.late_boundary_uic[i]; }
+	}
 	if (!m.boundary_fault || m.boundary_fault_sent || m.boundary_fault != phase) { return; }
 	m.boundary_fault_sent = true;
 	m.r[0x20 / 4] |= m.boundary_is;
@@ -676,6 +692,24 @@ static void model_boundary_progress(uint32_t off, bool vendor)
 	m.r[0x78 / 4] |= m.boundary_tm_dbr;
 	m.r[0x30 / 4] &= ~m.boundary_hcs_clear;
 	if (m.boundary_hce_off) { m.r[0x34 / 4] = 0; }
+}
+
+static void model_clear_progress(uint32_t off, bool vendor)
+{
+	/* The first UECDME read has completed; the next IS observation sees
+	 * this independent new state. Never inject before the original sample.
+	 */
+	if (vendor || off != 0x20 || !m.clear_fault || m.clear_fault_sent ||
+	    !m.boundary_fault_sent || m.uic_reads[4] != 1 || m.hce_enables || m.uic_commands || m.commands) { return; }
+	m.clear_fault_sent = true;
+	m.r[0x20 / 4] |= m.clear_is;
+	for (unsigned i = 0; i < 5; i++) { m.r[0x38 / 4 + i] |= m.clear_uic[i]; }
+	m.r[0x34 / 4] = m.clear_hce;
+	m.r[0x30 / 4] = (m.r[0x30 / 4] & ~m.clear_hcs_clear) | m.clear_hcs_set;
+	m.r[0x58 / 4] |= m.clear_dbr;
+	m.r[0x78 / 4] |= m.clear_tm_dbr;
+	m.r[0x60 / 4] |= m.clear_rsr;
+	m.r[0x80 / 4] |= m.clear_tm_rsr;
 }
 
 static bool model_clocks_running(void)
@@ -751,6 +785,7 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 	model_uic_progress();
 	model_command_progress();
 	model_boundary_progress(off, vendor);
+	model_clear_progress(off, vendor);
 	uint32_t value = (vendor ? m.v : m.r)[off / 4];
 	if (!vendor && off >= 0x38 && off <= 0x48) {
 		CHECK(m.exynos); /* No layer-code reads on Qualcomm, even with ufsprobe=1. */
@@ -772,6 +807,9 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 	}
 	if (!vendor && off == 0x20 && m.boundary_fault_sent && m.boundary_is_read_clear && m.commands == m.nops) {
 		m.r[off / 4] &= ~m.boundary_is;
+	}
+	if (!vendor && off == 0x20 && m.clear_fault_sent && m.clear_is_read_clear) {
+		m.r[off / 4] &= ~m.clear_is;
 	}
 	model_event('r', vendor, off, value);
 	return value;
@@ -1515,6 +1553,217 @@ static void warm_quarantine(void)
 	CHECK(ufs_read_capacity() == EIO);
 	CHECK(accesses == m.mmio_reads + m.mmio_writes && commands == m.commands);
 	CHECK(crc32(0, m.dma, m.size) == digest);
+}
+
+static void preenable_probe(void)
+{
+	warm_probe(false);
+	m.trace_boundaries = m.trace_through_nop = true;
+	m.boundary_fault = 1;
+	m.boundary_uic[0] = 0x80000010;
+}
+
+static void preenable_trace(unsigned samples, bool stopped)
+{
+	/* Independent trace: the original ten reads are unchanged. Only the
+	 * exact residue adds twelve adjacent confirmation reads, before any
+	 * clock/HCE write, barrier, delay or console operation.
+	 */
+	static const unsigned offsets[] = { 0x20, 0x34, 0x30, 0x58, 0x78, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x60, 0x80 };
+	unsigned first = 0;
+	while (first < m.pre_event_count && !(m.pre_events[first].kind == 'r' &&
+	    !m.pre_events[first].vendor && m.pre_events[first].off == 0x38)) { first++; }
+	CHECK(first >= 5 && first < m.pre_event_count && (samples == 1 || samples == 2));
+	first -= 5;
+	unsigned end = first;
+	for (unsigned sample = 0; sample < samples; sample++) {
+		unsigned count = sample ? 12 : 10;
+		CHECK(end + count <= m.pre_event_count);
+		for (unsigned i = 0; i < count; i++) {
+			const typeof(m.pre_events[0]) *e = &m.pre_events[end + i];
+			CHECK(e->kind == 'r' && !e->vendor && e->off == offsets[i]);
+		}
+		end += count;
+	}
+	if (stopped) {
+		for (unsigned i = end; i < m.pre_event_count; i++) { CHECK(m.pre_events[i].kind == 'p'); }
+		CHECK(m.mmio_writes == m.boundary_last_writes);
+	} else {
+		CHECK(samples == 2 && end < m.pre_event_count);
+		const typeof(m.pre_events[0]) *e = &m.pre_events[end];
+		CHECK(e->kind == 'r' && e->vendor && e->off == 0xb4); /* First clock RMW. */
+	}
+}
+
+static void preenable_failed(unsigned samples, int error)
+{
+	probe_to_hold();
+	preenable_trace(samples, true);
+	CHECK(m.boundary_fault_sent && su.boundary_seen == (samples == 2 ? 9u : 1u));
+	CHECK(!m.hce_enables && !m.clock_writes && !m.uic_commands && !m.commands && !m.smcs && !m.base_writes);
+	CHECK(!ss.cmd_failures && !ss.timeouts && !ss.retries && !m.writes && !m.syncs && !m.clears);
+	for (unsigned i = 0; i < 5; i++) { CHECK(su.boundary[0].uic[i] == m.boundary_uic[i]); }
+	const struct exynos_ufs_boundary *s = &su.boundary[samples == 2 ? 3 : 0];
+	CHECK(s->error == error && ss.last_is == s->is && ss.last_hcs == s->hcs);
+	CHECK(ss.is_errors == !!(s->is & MODEL_IS_ERRORS));
+	CHECK(occurrences("STARLTE UFS: boundary ") == 2 * samples && occurrences(" STOP\n") == 1);
+	CHECK(occurrences("boundary pre-HCE-clear ") == (samples == 2));
+	char line[128];
+	snprintf(line, sizeof(line), "probe FAILED (%d), writes 0, commands failed 0", error);
+	CHECK(occurrences(line) == 1);
+	unsigned accesses = m.mmio_reads + m.mmio_writes;
+	warm_quarantine();
+	size_t console_size = m.console_size;
+	exynos_ufs_log_boundaries();
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && console_size == m.console_size);
+}
+
+static void test_preenable_linereset(void)
+{
+	for (unsigned state = 0; state < 3; state++) {
+		case_name = "isolated pre-HCE LINERESET clears before startup/NOP and synthetic media reads";
+		preenable_probe();
+		m.drop_dp_on_hce = state != 1;
+		if (state == 2) { m.uic_fault_at = 5; m.uic_fault_is = 4; m.uic_fault_codes[0] = 0x80000010; }
+		probe_to_hold();
+		preenable_trace(2, false);
+		CHECK(!su.dead && su.nop_ready && su.host_owned && su.boundary_seen == 15);
+		CHECK(su.boundary[0].uic[0] == 0x80000010 && !su.boundary[0].error);
+		const struct exynos_ufs_boundary *s = &su.boundary[3];
+		CHECK(!s->is && !s->hce && s->hcs == 0x10f && !s->dbr && !s->tm_dbr && !s->rsr && !s->tm_rsr && !s->error);
+		for (unsigned i = 0; i < 5; i++) { CHECK(!s->uic[i]); }
+		CHECK(m.hce_enables == 1 && m.clock_writes == 6 && m.link_starts == 1 && m.uic_commands == 8);
+		CHECK(m.nops == 1 && m.nop_replies == 1 && m.opcount[0] == 1 && ss.reads >= 4);
+		CHECK(su.device_blocks == 0x10000 && su.first_block == 0x100 && su.nblocks == 0x2000);
+		CHECK(!m.writes && !m.syncs && !ss.cmd_failures && !ss.is_errors && !ss.retries);
+		CHECK(occurrences("STARLTE UFS: boundary ") == 8 && occurrences("boundary pre-HCE-clear ") == 1);
+		CHECK(occurrences("probe PASSED (0), writes 0, commands failed 0") == 1);
+		size_t console_size = m.console_size;
+		unsigned accesses = m.mmio_reads + m.mmio_writes;
+		exynos_ufs_log_boundaries();
+		CHECK(console_size == m.console_size && accesses == m.mmio_reads + m.mmio_writes);
+		passed(case_name);
+	}
+
+	case_name = "persistent pre-HCE PA LINERESET stops after one clearing check, without HCE";
+	preenable_probe(); m.uic_read_clear = false;
+	preenable_failed(2, EIO);
+	CHECK(su.boundary[3].uic[0] == 0x80000010 && m.uic_reads[0] == 2);
+	passed(case_name);
+	case_name = "recurrent read-cleared PA LINERESET remains fatal in the clearing confirmation";
+	preenable_probe(); m.clear_fault = true; m.clear_uic[0] = 0x80000010;
+	preenable_failed(2, EIO);
+	CHECK(m.clear_fault_sent && !m.r[0x38 / 4] && su.boundary[3].uic[0] == 0x80000010);
+	passed(case_name);
+
+	for (unsigned bit = 0; bit < 32; bit++) {
+		case_name = "every bit-neighbor of exact pre-HCE PA LINERESET is rejected, despite read-clearing";
+		preenable_probe(); m.boundary_uic[0] ^= 1u << bit;
+		preenable_failed(1, EIO); passed(case_name);
+		case_name = "any nonzero original IS excludes the pre-HCE allowance, including nonerror bits";
+		preenable_probe(); m.boundary_is = 1u << bit; m.boundary_is_read_clear = true;
+		preenable_failed(1, EIO); passed(case_name);
+	}
+	static const uint32_t raw_codes[] = { 1, 0x80000000, 0xdeadbeef };
+	for (unsigned layer = 1; layer < 5; layer++) {
+		for (unsigned raw = 0; raw < 3; raw++) {
+			case_name = "any other original layer indication excludes pre-HCE LINERESET consumption";
+			preenable_probe(); m.boundary_uic[layer] = raw_codes[raw];
+			preenable_failed(1, EIO); passed(case_name);
+		}
+	}
+	static const uint32_t hce_values[] = { 1, 2, 0x80000000 };
+	for (unsigned i = 0; i < 3; i++) {
+		case_name = "enabled/unknown nonzero HCE never consumes pre-enable LINERESET or restarts";
+		preenable_probe(); m.r[0x34 / 4] = hce_values[i];
+		preenable_failed(1, EIO); passed(case_name);
+	}
+	for (unsigned option = 0; option < 2; option++) {
+		case_name = "absent/zero ufslinkinit keeps the original strict pre-enable boundary";
+		preenable_probe(); m.nargs = 0; arg("ufsprobe", 1);
+		if (option) { arg("ufslinkinit", 0); }
+		m.allow_link_setup = false;
+		preenable_failed(1, EIO); passed(case_name);
+	}
+	for (unsigned bit = 0; bit < 4; bit++) {
+		case_name = "original readiness loss excludes isolated pre-HCE residue handling";
+		preenable_probe(); m.boundary_hcs_clear = 1u << bit;
+		preenable_failed(1, EIO); passed(case_name);
+	}
+	for (unsigned task = 0; task < 2; task++) {
+		case_name = "original pending transfer/task excludes isolated pre-HCE residue handling";
+		preenable_probe();
+		if (task) { m.boundary_tm_dbr = 1; } else { m.boundary_dbr = 1; }
+		preenable_failed(1, EIO); passed(case_name);
+	}
+
+	for (unsigned layer = 0; layer < 5; layer++) {
+		for (unsigned raw = 0; raw < 3; raw++) {
+			case_name = "new layer fault in clearing confirmation is retained and fatal even when it read-clears";
+			preenable_probe(); m.clear_fault = true; m.clear_uic[layer] = raw_codes[raw];
+			preenable_failed(2, EIO);
+			CHECK(m.clear_fault_sent && su.boundary[3].uic[layer] == raw_codes[raw] && !m.r[0x38 / 4 + layer]);
+			passed(case_name);
+		}
+	}
+	for (unsigned bit = 0; bit < 32; bit++) {
+		case_name = "any fresh IS in pre-HCE confirmation is retained and rejected despite read-clearing";
+		preenable_probe(); m.clear_fault = m.clear_is_read_clear = true; m.clear_is = 1u << bit;
+		preenable_failed(2, EIO);
+		CHECK(m.clear_fault_sent && su.boundary[3].is == m.clear_is && !m.r[0x20 / 4]);
+		passed(case_name);
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		case_name = "HCE changing during clearing confirmation prevents enabling stale HCE state";
+		preenable_probe(); m.clear_fault = true; m.clear_hce = hce_values[i];
+		preenable_failed(2, ENXIO); passed(case_name);
+	}
+	for (unsigned bit = 0; bit < 8; bit++) {
+		case_name = "fresh low-byte HCS readiness/reserved error changes prevent HCE setup";
+		preenable_probe(); m.clear_fault = true;
+		if (bit < 4) { m.clear_hcs_clear = 1u << bit; } else { m.clear_hcs_set = 1u << bit; }
+		preenable_failed(2, ENXIO); passed(case_name);
+	}
+	for (unsigned list = 0; list < 4; list++) {
+		for (unsigned raw = 0; raw < 3; raw++) {
+			case_name = "fresh pending/restarted/unknown transfer or task list state prevents HCE setup";
+			preenable_probe(); m.clear_fault = true;
+			uint32_t *fields[] = { &m.clear_dbr, &m.clear_tm_dbr, &m.clear_rsr, &m.clear_tm_rsr };
+			*fields[list] = raw_codes[raw];
+			preenable_failed(2, EBUSY); passed(case_name);
+		}
+	}
+	for (unsigned layer = 0; layer < 5; layer++) {
+		case_name = "post-HCE layer error cannot use the earlier clearing allowance at first UIC SET";
+		preenable_probe(); m.hce_uic[layer] = layer ? 0x80000001 : 0x80000010;
+		probe_to_hold(); preenable_trace(2, false);
+		CHECK(m.hce_enables == 1 && !m.uic_commands && !m.nops && !m.smcs && !ss.cmd_failures);
+		CHECK(su.boundary_seen == 9 && !su.boundary[3].error && occurrences("sent 0 done 0") == 1);
+		warm_quarantine(); passed(case_name);
+	}
+	case_name = "PA LINERESET during first UIC SET is not inherited pre-HCE residue";
+	preenable_probe(); m.uic_fault_at = 1; m.uic_fault_codes[0] = 0x80000010;
+	probe_to_hold();
+	CHECK(m.uic_commands == 1 && !m.smcs && !m.nops && !ss.cmd_failures);
+	warm_quarantine(); passed(case_name);
+	for (unsigned boundary = 2; boundary <= 3; boundary++) {
+		for (unsigned is = 0; is < 2; is++) {
+			case_name = "recurring PA LINERESET remains fatal at pre-NOP/pre-TUR, even with IS=0";
+			preenable_probe(); m.late_boundary = boundary;
+			m.late_boundary_is = is ? 4 : 0; m.late_boundary_uic[0] = 0x80000010;
+			probe_to_hold();
+			CHECK(su.dead && m.late_boundary_sent && !m.opcount[0] && m.nops == (boundary == 2 ? 1u : 0u));
+			CHECK(!ss.cmd_failures && !ss.timeouts && !m.writes && !ss.retries && !m.clears);
+			CHECK(su.boundary[boundary == 2 ? 1 : 2].error == EIO && !su.boundary[3].error);
+			unsigned accesses = m.mmio_reads + m.mmio_writes, commands = m.commands;
+			uint32_t digest = crc32(0, m.dma, m.size), value = 0;
+			dev_t dev = 0;
+			CHECK(sweet_ufs_rootdev(&dev) == EIO && !dev && exynos_ufs_uic(1, 0x1561, &value) == EIO);
+			CHECK(exynos_ufs_nop() == EIO && ufs_read_capacity() == EIO);
+			CHECK(accesses == m.mmio_reads + m.mmio_writes && commands == m.commands && crc32(0, m.dma, m.size) == digest);
+			passed(case_name);
+		}
+	}
 }
 
 static void test_link_startup(void)
@@ -2342,6 +2591,7 @@ int main(int argc, char **argv)
 	test_failures();
 	test_diagnostics();
 	test_boundaries();
+	test_preenable_linereset();
 	test_link_startup();
 	test_uic_failures();
 	test_nop();

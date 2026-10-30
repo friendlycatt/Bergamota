@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -37,11 +37,13 @@
+  * enable-only attempt by default. A timed-out Exynos host is never retried
+  * or its DMA reused.
+  * ufsprobe=1 holds the final read-only probe result before any root mount.
+- * It also saves two pre-submit UIC boundaries, stopping before the next
+- * setup action/doorbell on a sampled error, including read-cleared codes.
++ * It also saves pre-submit UIC boundaries, stopping before the next setup
++ * action/doorbell on a sampled error, including read-cleared codes.
+  * ufslinkinit=1 with ufsprobe=1 completes a newly enabled Exynos host with
+  * local CPort setup and one DME_LINKSTARTUP, then verifies NOP OUT/IN before
+- * SCSI. This warm-start experiment still depends on the inherited PHY
++ * SCSI. Only an isolated IS=0/HCE=0 PA.LINERESET at pre-enable may be
++ * consumed, with a saved clean confirmation before clock/HCE setup.
++ * This warm-start experiment still depends on the inherited PHY
+  * calibration; it never resets the device or reuses timed-out DMA.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -184,6 +186,7 @@
+ 
+ struct exynos_ufs_boundary {
+ 	uint32_t is, hce, hcs, dbr, tm_dbr, uic[5];
++	uint32_t rsr, tm_rsr;                    /* only the pre-HCE clear confirmation */
+ 	int error;
+ };
+ 
+@@ -200,7 +203,7 @@
+ 	bool boundary_probe;                    /* exact Exynos board and ufsprobe=1 */
+ 	bool link_init, nop_ready;               /* opt-in warm-start/UTP experiment */
+ 	uint8_t boundary_seen, boundary_logged;
+-	struct exynos_ufs_boundary boundary[3]; /* enable/TUR/NOP, retained for this boot */
++	struct exynos_ufs_boundary boundary[4]; /* enable/TUR/NOP/clear, retained for this boot */
+ 	int init_error;
+ 	uint8_t lun;
+ 	uint8_t tag;
+@@ -511,6 +514,9 @@
+  * These sequential observations are not an atomic or passive snapshot.
+  * The opt-in startup path adds a separate pre-NOP slot (phase 2); the
+  * original pre-enable/pre-TUR slots and their read order are unchanged.
++ * An exact pre-HCE LINERESET can be consumed only by the startup path:
++ * slot 3 must confirm cleared codes, IS=HCE=0 and ready/stopped/idle lists
++ * before any clock/HCE write. No polling, acknowledgement or reset here.
+  */
+ static int
+ exynos_ufs_check_boundary(unsigned phase)
+@@ -532,8 +538,16 @@
+ 	s->uic[3] = ufs_rd(REG_UECT);
+ 	s->uic[4] = ufs_rd(REG_UECDME);
+ 	su.boundary_seen |= bit;
+-	if ((s->is & UFS_IS_ERR_MASK) || s->uic[0] || s->uic[1] ||
+-	    s->uic[2] || s->uic[3] || s->uic[4]) {
++	/* Linux v6.6 ufshcd consumes UECPA's LINK_STARTUP LINERESET latch.
++	 * Firmware may have left that code behind after IS acknowledgement,
++	 * but its origin/clearing is not established by the phone photograph.
++	 * Never ignore a live UIC error or apply this at NOP/TUR boundaries.
++	 */
++	bool consume = phase == 0 && su.link_init && su.unipro && s->is == 0 && s->hce == 0 &&
++	    (s->hcs & 0xffu) == HCS_EXYNOS_RDY && !s->dbr && !s->tm_dbr &&
++	    s->uic[0] == 0x80000010u && !s->uic[1] && !s->uic[2] && !s->uic[3] && !s->uic[4];
++	if (((s->is & UFS_IS_ERR_MASK) || s->uic[0] || s->uic[1] ||
++	    s->uic[2] || s->uic[3] || s->uic[4]) && !consume) {
+ 		s->error = EIO;
+ 	} else if (s->dbr || s->tm_dbr) {
+ 		s->error = EBUSY;
+@@ -542,6 +556,33 @@
+ 	} else if (phase == 2 && (!(ufs_rd(REG_UTRLRSR) & 1u) || (ufs_rd(REG_UTMRLRSR) & 1u))) {
+ 		s->error = ENXIO;
+ 	}
++	if (!s->error && consume) {
++		/* Preserve the first raw indication; a later zero cannot erase it.
++		 * One immediate confirmation, including both stopped lists. Any
++		 * persistent/recurrent code or changed state prevents HCE setup.
++		 */
++		s = &su.boundary[3];
++		s->is = ufs_rd(REG_IS);
++		s->hce = ufs_rd(REG_HCE);
++		s->hcs = ufs_rd(REG_HCS);
++		s->dbr = ufs_rd(REG_UTRLDBR);
++		s->tm_dbr = ufs_rd(REG_UTMRLDBR);
++		s->uic[0] = ufs_rd(REG_UECPA);
++		s->uic[1] = ufs_rd(REG_UECDL);
++		s->uic[2] = ufs_rd(REG_UECN);
++		s->uic[3] = ufs_rd(REG_UECT);
++		s->uic[4] = ufs_rd(REG_UECDME);
++		s->rsr = ufs_rd(REG_UTRLRSR);
++		s->tm_rsr = ufs_rd(REG_UTMRLRSR);
++		su.boundary_seen |= 8u;
++		if (s->is || s->uic[0] || s->uic[1] || s->uic[2] || s->uic[3] || s->uic[4]) {
++			s->error = EIO;
++		} else if (s->dbr || s->tm_dbr || s->rsr || s->tm_rsr) {
++			s->error = EBUSY;
++		} else if (s->hce != 0 || (s->hcs & 0xffu) != HCS_EXYNOS_RDY) {
++			s->error = ENXIO;
++		}
++	}
+ 	if (s->error) {
+ 		su.dead = true;
+ 		ss.last_is = s->is;
+@@ -553,21 +594,27 @@
+ 
+ /* Print only at the probe hold, never between the final sample and the
+  * first TUR doorbell. No MMIO or DMA is read here, even after quarantine.
+- * Two two-line records per boot (three with ufslinkinit=1), independent of
+- * the pre-cleanup samples.
++ * Two two-line records per boot (three with ufslinkinit=1, plus at most one
++ * pre-HCE clearing confirmation), independent of the pre-cleanup samples.
+  */
+ static void
+ exynos_ufs_log_boundaries(void)
+ {
+-	static const char *const names[] = { "pre-enable", "pre-TUR", "pre-NOP" };
+-	for (unsigned i = 0; i < 3; i++) {
++	static const char *const names[] = { "pre-enable", "pre-TUR", "pre-NOP", "pre-HCE-clear" };
++	for (unsigned i = 0; i < 4; i++) {
+ 		uint8_t bit = 1u << i;
+ 		if (!(su.boundary_seen & bit) || (su.boundary_logged & bit)) { continue; }
+ 		su.boundary_logged |= bit;
+ 		const struct exynos_ufs_boundary *s = &su.boundary[i];
+-		printf("STARLTE UFS: boundary %s IS %08x HCE %x HCS %x DBR %x TM %x%s\n",
+-		    names[i], s->is, s->hce, s->hcs, s->dbr, s->tm_dbr,
+-		    s->error ? " STOP" : "");
++		if (i == 3) {
++			printf("STARLTE UFS: boundary pre-HCE-clear IS %08x HCE %x HCS %x DBR %x TM %x RSR %x/%x%s\n",
++			    s->is, s->hce, s->hcs, s->dbr, s->tm_dbr, s->rsr, s->tm_rsr,
++			    s->error ? " STOP" : "");
++		} else {
++			printf("STARLTE UFS: boundary %s IS %08x HCE %x HCS %x DBR %x TM %x%s\n",
++			    names[i], s->is, s->hce, s->hcs, s->dbr, s->tm_dbr,
++			    s->error ? " STOP" : "");
++		}
+ 		printf("STARLTE UFS: boundary UIC PA %08x DL %08x NL %08x TL %08x DME %08x\n",
+ 		    s->uic[0], s->uic[1], s->uic[2], s->uic[3], s->uic[4]);
+ 	}
