@@ -8,8 +8,10 @@ different board descriptions.
 shows the bounded **HCE enable succeeded** (`HCE=1`, `HCS=0x10f`, `IS=0`) and
 the **FMP format call returned 0**. The first TEST UNIT READY command then
 **timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
-The next probe needs layer-error and request/descriptor diagnostics before
-cleanup. **Samsung media reads and an iOS root mount remain unverified**.
+The [probe-3 pre-cleanup diagnostics](#probe-3-pre-cleanup-diagnostics) and fresh
+delivery/guard scripts are validated; Intel CI **41014066730** is dispatched,
+but its compiler result and new image are not available yet.
+**Samsung media reads and an iOS root mount remain unverified**.
 The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
 **40955206538** are verified; all **148 manifest entries / 149 archive files**
 match. Local transport/compilation checks and the audited QEMU failure hold pass.
@@ -943,8 +945,39 @@ Exact GNU export, forward/reverse application and **498 protected-artifact
 hashes** pass. Fresh `verify-series.py --out research/starlte/series-check-ufs-probe-3`
 exits **0**: **four staging scripts / 277 patches / 6369 source files exact**,
 including the 14 pre-1131 and one pre-1132 baseline hashes; only the two documented
-dxb skips. The next CI/image remains pending at this local-validation milestone;
-the current phone result remains probe 2's timeout.
+dxb skips. Implementation **`4d12ded8d3b18048e8e5e8f685a997c8a1983f59`** and
+the physical-observation commit **`de43bcb`** are pushed. Explicit Intel build
+[41014066730](https://github.com/friendlycatt/Bergamota/actions/runs/41014066730)
+uses **26.5 / DEVELOPMENT / SWEET / Xcode 26.1 / use_kdk=true / keep_going=true**,
+source **4d12ded**, job **123926261213**, **queued at dispatch**. A retained
+completion watcher saves metadata/actions/artifact evidence; no compiler result
+or probe-3 image is available yet. The current phone result remains probe 2's timeout.
+
+Fresh isolated preparation in `research/starlte/ufs-probe-3-bringup/` pins the
+new source/run/output paths and refuses existing one-shot outputs. The prepared
+delivery contains the unchanged checked **1740800-byte Image** and ELF, fresh
+hardware/QEMU ADTs, zero hardware DMA/Image placeholders and no QEMU UFS node.
+All **352 tracked source hashes** match **4d12ded**; all **498 protected
+probe-1/probe-2 files** and the old reproduction suite remain unchanged.
+
+The complete new downloader/profile/inspection/package/capture/finalizer/test
+suite and three independent auditors pass **13 syntax checks / 25 unittest
+methods with adversarial subtests**. The source profile expects **6374 files**,
+derived from the new local reconstruction, six exact dxb substitutions and
+**nine previously reviewed/hash-pinned external-header copies** prepared before
+examining the new CI archive. No exclusions or learned-from-archive expectations,
+independent SDK/KDK reinstall or byte-identical kernel rebuild are claimed.
+The unchanged exception policy is AST-verified against both older captures.
+
+A **SYNTHETIC format-only** finalizer fixture passes **ten negative guards /
+95 manifest files / exact archive hashes**, explicitly mocking old-kernel,
+archive-pin and full-source-proof boundaries; the strict metadata guard remains
+active and real marker checks reject both older kernels. An old-probe-2 format
+smoke also passes **43778048 host-loader RAM bytes exact**, dirty destinations,
+fresh seeds/source unchanged and independent Samsung section/metadata/SHA-1
+checks. These are **not probe-3 CI, Samsung storage or phone execution results**.
+Real artifacts must still be downloaded/reconciled, packaged, captured for
+90 seconds in QEMU, visually reviewed and independently audited before delivery.
 
 ## Getting-started guide review for S9
 
