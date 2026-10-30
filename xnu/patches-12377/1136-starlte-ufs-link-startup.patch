@@ -1,0 +1,530 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -34,11 +34,15 @@
+  * RAM, and mapped Normal non-cacheable. Samsung needs byte-based UTRD
+  * fields, 128-byte FMP-bypass PRDT entries, Nexus setup and positive-bit
+  * list clearing. An inherited ready/idle host with HCE=0 gets one bounded
+- * enable-only attempt, never a blind PHY/link reset. Readiness must survive
+- * enabling. A timed-out Exynos host is never retried or its DMA reused.
++ * enable-only attempt by default. A timed-out Exynos host is never retried
++ * or its DMA reused.
+  * ufsprobe=1 holds the final read-only probe result before any root mount.
+  * It also saves two pre-submit UIC boundaries, stopping before the next
+  * setup action/doorbell on a sampled error, including read-cleared codes.
++ * ufslinkinit=1 with ufsprobe=1 completes a newly enabled Exynos host with
++ * local CPort setup and one DME_LINKSTARTUP, then verifies NOP OUT/IN before
++ * SCSI. This warm-start experiment still depends on the inherited PHY
++ * calibration; it never resets the device or reuses timed-out DMA.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -107,6 +111,10 @@
+ #define REG_UTRLRSR     0x60
+ #define REG_UTMRLDBR    0x78
+ #define REG_UTMRLRSR    0x80
++#define REG_UICCMD      0x90
++#define REG_UICARG1     0x94
++#define REG_UICARG2     0x98
++#define REG_UICARG3     0x9c
+ 
+ /* Vendor window at 0x11121100, separate from the standard HCI window. */
+ #define EXYNOS_TXPRDT   0x00
+@@ -116,7 +124,18 @@
+ #define EXYNOS_GPIO     0x70
+ #define EXYNOS_CLKSTOP  0xb0
+ #define EXYNOS_FORCEHCS 0xb4
++#define EXYNOS_ACGDIS   0xfc
++#define EXYNOS_CORE_AUTOGATE (1u << 4)
++#define EXYNOS_LINK_CLKSTOP  0x17u /* REFCLKOUT/REFCLK/UniPro MCLK/PCLK */
+ #define EXYNOS_PRD_SIZE 128u
++#define EXYNOS_LINK_CNF 0x7854 /* UniPro window, not the vendor HCI window */
++
++#define UIC_DME_GET     0x01u
++#define UIC_DME_SET     0x02u
++#define UIC_LINKSTARTUP 0x16u
++#define IS_UIC_COMPLETE (1u << 10)
++#define IS_LINKSTARTUP  (1u << 8)
++#define UIC_TIMEOUT_NS  500000000ull
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -171,6 +190,7 @@
+ static struct {
+ 	vm_offset_t regs;
+ 	vm_offset_t vendor;
++	vm_offset_t unipro;
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint64_t device_blocks;                 /* Exynos READ CAPACITY, current/root LUN */
+@@ -178,8 +198,9 @@
+ 	bool exynos, dma_nc, host_owned, dead;
+ 	bool attempted;
+ 	bool boundary_probe;                    /* exact Exynos board and ufsprobe=1 */
++	bool link_init, nop_ready;               /* opt-in warm-start/UTP experiment */
+ 	uint8_t boundary_seen, boundary_logged;
+-	struct exynos_ufs_boundary boundary[2]; /* retained for this entire boot */
++	struct exynos_ufs_boundary boundary[3]; /* enable/TUR/NOP, retained for this boot */
+ 	int init_error;
+ 	uint8_t lun;
+ 	uint8_t tag;
+@@ -254,6 +275,12 @@
+ 	*(volatile uint32_t *)(su.vendor + off) = v;
+ }
+ 
++static inline uint32_t
++exynos_unipro_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.unipro + off);
++}
++
+ /* Samsung fmp.c: select DESCTYPE 3 (128-byte entries), embedded host 0.
+  * This changes the descriptor format, not disk keys or SMU access regions.
+  * All PRDT encryption selectors remain zero (raw, unencrypted transfers).
+@@ -312,6 +339,166 @@
+ 
+ static uint32_t ufs_fail_logged;
+ 
++/* HCE/UCRDY only describe the host command interface. Samsung follows HCE
++ * initialization with local CPort setup, LINKSTARTUP and a UTP handshake.
++ * All UIC operations here run with both request lists stopped and idle.
++ * GET_GENERRCODE_DIRECT requires LINKSTARTUP's UniPro CNF result; generic
++ * UICARG2 is recorded but is not authoritative for that command on 9810.
++ */
++static int
++exynos_ufs_uic(uint32_t command, uint16_t attr, uint32_t *value)
++{
++	if (!su.exynos || !su.link_init || !su.unipro || su.dead) { return EIO; }
++	if (command != UIC_DME_GET && command != UIC_DME_SET && command != UIC_LINKSTARTUP) {
++		return EINVAL;
++	}
++	if (command != UIC_LINKSTARTUP && !value) { return EINVAL; }
++	uint32_t is = ufs_rd(REG_IS), hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	uint32_t codes[5], result = UINT32_MAX, arg2 = UINT32_MAX, ack_is = 0;
++	bool submitted = false, completed = false, line_reset = false;
++	int error = 0;
++	if (ufs_rd(REG_UTRLDBR) || ufs_rd(REG_UTMRLDBR) ||
++	    ((ufs_rd(REG_UTRLRSR) | ufs_rd(REG_UTMRLRSR)) & 1u)) {
++		error = EBUSY;
++	} else if (!(hce & 1u) || !(hcs & HCS_UCRDY) || (hcs & 0xf0u)) {
++		error = ENXIO;
++	} else if (is & UFS_IS_ERR_MASK) {
++		error = EIO;
++	}
++	for (unsigned i = 0; i < 5; i++) { codes[i] = ufs_rd(REG_UECPA + 4u * i); }
++	if (codes[0] || codes[1] || codes[2] || codes[3] || codes[4]) { error = EIO; }
++	if (error) { goto out; }
++
++	/* A stale completion must not make an unexecuted command look successful. */
++	ufs_wr(REG_IS, IS_UIC_COMPLETE);
++	__builtin_arm_dsb(0xf);
++	is = ufs_rd(REG_IS);
++	if (is & (IS_UIC_COMPLETE | UFS_IS_ERR_MASK)) { error = EIO; goto out; }
++	ufs_wr(REG_UICARG1, (uint32_t)attr << 16);
++	ufs_wr(REG_UICARG2, 0);
++	ufs_wr(REG_UICARG3, command == UIC_DME_SET ? *value : 0);
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UICCMD, command);
++	__builtin_arm_dsb(0xf);
++	submitted = true;
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(UIC_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	is = 0;
++	/* Also cap iterations if the inherited counter ever stops advancing. */
++	for (unsigned poll = 0; poll < 5000; poll++) {
++		is |= ufs_rd(REG_IS); /* retain an earlier error even if its latch clears */
++		if (is & IS_UIC_COMPLETE) { completed = true; break; }
++		if ((is & (UFS_IS_ERR_MASK & ~4u)) ||
++		    ((is & 4u) && command != UIC_LINKSTARTUP)) { break; }
++		if (mach_absolute_time() >= deadline) { break; }
++		delay(100);
++	}
++	hce = ufs_rd(REG_HCE);
++	hcs = ufs_rd(REG_HCS);
++	arg2 = ufs_rd(REG_UICARG2);
++	result = command == UIC_LINKSTARTUP ? exynos_unipro_rd(EXYNOS_LINK_CNF) & 0xffu : arg2 & 0xffu;
++	for (unsigned i = 0; i < 5; i++) { codes[i] = ufs_rd(REG_UECPA + 4u * i); }
++	/* A successful LINKSTARTUP can itself raise PA.LINERESET (Linux ufshcd
++	 * consumes UECPA after startup). Permit only that exact indication in
++	 * this command's completion, never before startup or during a transfer.
++	 */
++	line_reset = command == UIC_LINKSTARTUP && completed && !result &&
++	    (is & UFS_IS_ERR_MASK) == 4u && codes[0] == 0x80000010u &&
++	    !codes[1] && !codes[2] && !codes[3] && !codes[4];
++	if (((is & UFS_IS_ERR_MASK) || codes[0] || codes[1] || codes[2] || codes[3] || codes[4]) &&
++	    !line_reset) {
++		error = EIO;
++	} else if (!completed) {
++		error = ETIMEDOUT;
++	} else if (result) {
++		error = EIO;
++	} else if (!(hce & 1u) || !(hcs & HCS_UCRDY) || (hcs & 0xf0u)) {
++		error = ENXIO;
++	} else if (ufs_rd(REG_UTRLDBR) || ufs_rd(REG_UTMRLDBR) ||
++	    ((ufs_rd(REG_UTRLRSR) | ufs_rd(REG_UTMRLRSR)) & 1u)) {
++		error = EBUSY;
++	}
++	if (!error) {
++		if (command == UIC_DME_GET) { *value = ufs_rd(REG_UICARG3); }
++		ufs_wr(REG_IS, IS_UIC_COMPLETE | (is & IS_LINKSTARTUP) | (line_reset ? 4u : 0u));
++		__builtin_arm_dsb(0xf);
++		ack_is = ufs_rd(REG_IS);
++		if (ack_is & (IS_UIC_COMPLETE | UFS_IS_ERR_MASK)) { error = EIO; }
++	}
++out:
++	if (error || command == UIC_LINKSTARTUP) {
++		printf("STARLTE UFS: UIC %02x attr %04x sent %u done %u result %x arg2 %x ack %x error %d\n",
++		    command, attr, submitted, completed, result, arg2, ack_is, error);
++		printf("STARLTE UFS: UIC setup IS %08x HCE %x HCS %x PA %08x DL %08x NL %08x TL %08x DME %08x\n",
++		    is, hce, hcs, codes[0], codes[1], codes[2], codes[3], codes[4]);
++	}
++	if (error) {
++		su.dead = true;
++		ss.last_is = is | ack_is;
++		ss.last_hcs = hcs;
++		if (ss.last_is & UFS_IS_ERR_MASK) { ss.is_errors++; }
++	}
++	return error;
++}
++
++static int
++exynos_ufs_keep_awake(void)
++{
++	/* exynos_ufs_pre_setup_clocks(on): preserve unrelated bits, disable
++	 * automatic core/HW clock gating and unstop the inherited link clocks.
++	 * The starlte DT selects hw-rev 5; its refclk mux is not changed here.
++	 */
++	exynos_wr(EXYNOS_FORCEHCS, exynos_rd(EXYNOS_FORCEHCS) & ~EXYNOS_CORE_AUTOGATE);
++	exynos_wr(EXYNOS_CLKSTOP, exynos_rd(EXYNOS_CLKSTOP) & ~EXYNOS_LINK_CLKSTOP);
++	exynos_wr(EXYNOS_ACGDIS, exynos_rd(EXYNOS_ACGDIS) | 1u);
++	__builtin_arm_dsb(0xf);
++	if ((exynos_rd(EXYNOS_FORCEHCS) & EXYNOS_CORE_AUTOGATE) ||
++	    (exynos_rd(EXYNOS_CLKSTOP) & EXYNOS_LINK_CLKSTOP) ||
++	    !(exynos_rd(EXYNOS_ACGDIS) & 1u)) {
++		su.dead = true;
++		printf("STARLTE UFS: warm-start clock controls did not take\n");
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++exynos_ufs_start_link(bool initialized)
++{
++	int error;
++	if (initialized) {
++		/* HCE initialization may have reset vendor clock controls. Samsung
++		 * also sets these in its post-HCE, pre-link notification.
++		 */
++		error = exynos_ufs_keep_awake();
++		if (error) { return error; }
++		/* ufs-cal-9810.c init_cfg: local device 0, valid, peer 1, CPort
++		 * connected. Keep PHY calibration/timing inherited from firmware.
++		 */
++		static const uint16_t attrs[] = { 0x3000, 0x3001, 0x4021, 0x4020 };
++		for (unsigned i = 0; i < 4; i++) {
++			uint32_t value = i ? 1 : 0;
++			error = exynos_ufs_uic(UIC_DME_SET, attrs[i], &value);
++			if (error) { return error; }
++		}
++		error = exynos_ufs_uic(UIC_LINKSTARTUP, 0, NULL);
++		if (error) { return error; }
++	}
++	uint32_t tx = 0, rx = 0, connected = 0;
++	if ((error = exynos_ufs_uic(UIC_DME_GET, 0x1561, &tx)) ||
++	    (error = exynos_ufs_uic(UIC_DME_GET, 0x1581, &rx)) ||
++	    (error = exynos_ufs_uic(UIC_DME_GET, 0x4020, &connected))) { return error; }
++	uint32_t hcs = ufs_rd(REG_HCS);
++	printf("STARLTE UFS: warm link %s TX/RX %u/%u CPort %u HCS %x\n",
++	    initialized ? "started" : "inherited", tx, rx, connected, hcs);
++	if (!tx || tx > 2 || !rx || rx > 2 || connected != 1 || (hcs & 0xffu) != HCS_EXYNOS_RDY) {
++		su.dead = true;
++		return ENXIO;
++	}
++	return 0;
++}
++
+ static inline uint32_t
+ be32(const uint8_t *p)
+ {
+@@ -322,15 +509,18 @@
+  * at each boundary. UIC reads may clear latches; persist the raw values
+  * and quarantine before any later setup or submission can hide them.
+  * These sequential observations are not an atomic or passive snapshot.
++ * The opt-in startup path adds a separate pre-NOP slot (phase 2); the
++ * original pre-enable/pre-TUR slots and their read order are unchanged.
+  */
+ static int
+-exynos_ufs_check_boundary(bool before_tur)
++exynos_ufs_check_boundary(unsigned phase)
+ {
+ 	if (!su.exynos || !su.boundary_probe) { return 0; }
+ 	if (su.dead) { return EIO; }
+-	uint8_t bit = 1u << before_tur;
++	if (phase > 2 || (phase == 2 && !su.link_init)) { return EINVAL; }
++	uint8_t bit = 1u << phase;
+ 	if (su.boundary_seen & bit) { return 0; }
+-	struct exynos_ufs_boundary *s = &su.boundary[before_tur];
++	struct exynos_ufs_boundary *s = &su.boundary[phase];
+ 	s->is = ufs_rd(REG_IS);
+ 	s->hce = ufs_rd(REG_HCE);
+ 	s->hcs = ufs_rd(REG_HCS);
+@@ -347,7 +537,9 @@
+ 		s->error = EIO;
+ 	} else if (s->dbr || s->tm_dbr) {
+ 		s->error = EBUSY;
+-	} else if ((s->hcs & 0xffu) != HCS_EXYNOS_RDY || (before_tur && !(s->hce & 1u))) {
++	} else if ((s->hcs & 0xffu) != HCS_EXYNOS_RDY || (phase && !(s->hce & 1u))) {
++		s->error = ENXIO;
++	} else if (phase == 2 && (!(ufs_rd(REG_UTRLRSR) & 1u) || (ufs_rd(REG_UTMRLRSR) & 1u))) {
+ 		s->error = ENXIO;
+ 	}
+ 	if (s->error) {
+@@ -361,18 +553,20 @@
+ 
+ /* Print only at the probe hold, never between the final sample and the
+  * first TUR doorbell. No MMIO or DMA is read here, even after quarantine.
+- * Two two-line records per boot, independent of the pre-cleanup samples.
++ * Two two-line records per boot (three with ufslinkinit=1), independent of
++ * the pre-cleanup samples.
+  */
+ static void
+ exynos_ufs_log_boundaries(void)
+ {
+-	for (unsigned i = 0; i < 2; i++) {
++	static const char *const names[] = { "pre-enable", "pre-TUR", "pre-NOP" };
++	for (unsigned i = 0; i < 3; i++) {
+ 		uint8_t bit = 1u << i;
+ 		if (!(su.boundary_seen & bit) || (su.boundary_logged & bit)) { continue; }
+ 		su.boundary_logged |= bit;
+ 		const struct exynos_ufs_boundary *s = &su.boundary[i];
+ 		printf("STARLTE UFS: boundary %s IS %08x HCE %x HCS %x DBR %x TM %x%s\n",
+-		    i ? "pre-TUR" : "pre-enable", s->is, s->hce, s->hcs, s->dbr, s->tm_dbr,
++		    names[i], s->is, s->hce, s->hcs, s->dbr, s->tm_dbr,
+ 		    s->error ? " STOP" : "");
+ 		printf("STARLTE UFS: boundary UIC PA %08x DL %08x NL %08x TL %08x DME %08x\n",
+ 		    s->uic[0], s->uic[1], s->uic[2], s->uic[3], s->uic[4]);
+@@ -443,13 +637,13 @@
+ }
+ 
+ /*
+- * One attempt of one SCSI command in slot 0, data (if any) to/from the DMA window at data_off
++ * One SCSI command or the opt-in NOP handshake in slot 0, data (if any) to/from data_off
+  * (to the device when write is set). Returns 0 or an errno; *retry says whether repeating the
+  * command can help (transient device condition, timeout): every command we issue is idempotent.
+  */
+ static int
+-ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off,
+-    bool *retry)
++ufs_transfer_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off,
++    bool *retry, bool nop)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -459,6 +653,8 @@
+ 	if (su.dead || !su.host_owned) {
+ 		return EIO;
+ 	}
++	if (nop && (!su.exynos || !su.link_init || su.nop_ready || len || write)) { return EINVAL; }
++	if (!nop && su.link_init && !su.nop_ready) { return EIO; }
+ 	if (!cdb_len || cdb_len > 16 || len > BOUNCE_SIZE || ((data_off | len) & 3u) ||
+ 	    data_off < DMA_BOUNCE ||
+ 	    data_off > su.dma_size || len > su.dma_size - data_off) {
+@@ -477,15 +673,15 @@
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 
+-	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
++	ucd->cmd[0] = nop ? 0x00 : 0x01;        /* NOP OUT or COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+-	ucd->cmd[2] = su.lun;
++	ucd->cmd[2] = nop ? 0 : su.lun;
+ 	ucd->cmd[3] = su.exynos ? 0 : ++su.tag; /* Samsung task tag is slot 0 */
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
+ 	ucd->cmd[15] = (uint8_t)len;
+-	memcpy(&ucd->cmd[16], cdb, cdb_len);
++	if (!nop) { memcpy(&ucd->cmd[16], cdb, cdb_len); }
+ 
+ 	/* DD: 1 = memory to device, 2 = device to memory. */
+ 	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
+@@ -531,14 +727,15 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	if (su.exynos) {
+-		exynos_wr(EXYNOS_NEXUS, exynos_rd(EXYNOS_NEXUS) | 1u);
++		uint32_t nexus = exynos_rd(EXYNOS_NEXUS);
++		exynos_wr(EXYNOS_NEXUS, nop ? nexus & ~1u : nexus | 1u);
+ 		__builtin_arm_dsb(0xf);
+-		if (!(exynos_rd(EXYNOS_NEXUS) & 1u)) {
++		if ((exynos_rd(EXYNOS_NEXUS) & 1u) != (nop ? 0u : 1u)) {
+ 			su.dead = true;
+ 			return EIO;
+ 		}
+-		if (cdb[0] == 0x00) {
+-			int error = exynos_ufs_check_boundary(true);
++		if (nop || cdb[0] == 0x00) {
++			int error = exynos_ufs_check_boundary(nop ? 2 : 1);
+ 			if (error) { return error; }
+ 		}
+ 	}
+@@ -657,6 +854,24 @@
+ 			return EIO;
+ 		}
+ 	}
++	if (nop) {
++		/* NOP IN has no LUN, flags, status or data segment; only tag 0.
++		 * A cleared DBR or OCS alone is not evidence of a device reply.
++		 */
++		bool valid = !ocs && ucd->resp[0] == 0x20;
++		for (unsigned i = 1; i < 32; i++) { valid = valid && ucd->resp[i] == 0; }
++		if (!valid) {
++			ss.cmd_failures++;
++			ss.last_ocs = ocs;
++			ss.last_upiu = ucd->resp[0];
++			su.dead = true;
++			printf("STARLTE UFS: invalid NOP IN ocs %x header %08x %08x %08x\n",
++			    ocs, be32(ucd->resp), be32(ucd->resp + 4), be32(ucd->resp + 8));
++			return EIO;
++		}
++		su.nop_ready = true;
++		return 0;
++	}
+ 	if (su.exynos && (ucd->resp[2] != su.lun || ucd->resp[3] != 0)) {
+ 		printf("STARLTE UFS: mismatched response LUN/tag %u/%u, expected %u/0\n",
+ 		    ucd->resp[2], ucd->resp[3], su.lun);
+@@ -721,6 +936,25 @@
+ 	return 0;
+ }
+ 
++static int
++ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off,
++    bool *retry)
++{
++	return ufs_transfer_once(cdb, cdb_len, len, write, data_off, retry, false);
++}
++
++static int
++exynos_ufs_nop(void)
++{
++	static const uint8_t empty[6] = { 0 };
++	bool retry;
++	printf("STARLTE UFS: NOP OUT, verifying device transport before SCSI\n");
++	int error = ufs_transfer_once(empty, sizeof(empty), 0, false, DMA_BOUNCE, &retry, true);
++	if (error) { ss.errors++; }
++	printf("STARLTE UFS: NOP IN result %d\n", error);
++	return error;
++}
++
+ /* ufs_scsi_once with retries (ufsretries, default 3), data window at data_off. */
+ static int
+ ufs_scsi_at(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off)
+@@ -1107,6 +1341,7 @@
+ exynos_enable_inherited_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	bool initialized = false;
+ 	/* Samsung ufshcd_get_lists_status() requires bits 1..3 set and
+ 	 * bits 4..7 clear; add Device Present. Upper power status is separate.
+ 	 */
+@@ -1123,7 +1358,7 @@
+ 		/* Takeover has already acknowledged IS and stopped both lists.
+ 		 * Sample enabled hosts too, without re-enabling them.
+ 		 */
+-		int error = exynos_ufs_check_boundary(false);
++		int error = exynos_ufs_check_boundary(0);
+ 		if (error) { return error; }
+ 		hce = su.boundary[0].hce;
+ 		hcs = su.boundary[0].hcs;
+@@ -1131,17 +1366,21 @@
+ 		printf("STARLTE UFS: host error after list stop (is 0x%x)\n", ufs_rd(REG_IS));
+ 		return EIO;
+ 	}
++	if (su.link_init) {
++		int error = exynos_ufs_keep_awake();
++		if (error) { return error; }
++	}
+ 	if (!(hce & 1u)) {
+ 		/* Exynos9810's pinned driver does not select USE_OF_HCE. Follow
+ 		 * __ufshcd_hba_enable(): write 1, allow the 1->0->1 initialization
+ 		 * transition for 1 ms, then at most ten 5 ms delays. Do not accept
+ 		 * the immediate write echo as completed initialization.
+-		 * This is NOT cold-host initialization: preserve the inherited
+-		 * vendor/PHY configuration. HCE initialization may invalidate the
+-		 * link; if readiness disappears, stop rather than blindly applying
+-		 * PHY calibration or DME_LINKSTARTUP.
++		 * The opt-in warm-start path handles the link invalidation below;
++		 * the default path still requires inherited Device Present. Neither
++		 * path performs PHY calibration or a device reset.
+ 		 */
+-		printf("STARLTE UFS: HCE enable-only attempt (inherited ready, idle lists)\n");
++		printf("STARLTE UFS: HCE %s attempt (inherited ready, idle lists)\n",
++		    su.link_init ? "warm-start" : "enable-only");
+ 		ufs_wr(REG_HCE, 1);
+ 		__builtin_arm_dsb(0xf);
+ 		delay(1000);
+@@ -1156,9 +1395,11 @@
+ 			su.dead = true;
+ 			return ETIMEDOUT;
+ 		}
++		initialized = true;
+ 	}
+-	if (!(hce & 1u) || (hcs & 0xffu) != HCS_EXYNOS_RDY) {
+-		printf("STARLTE UFS: enable-only lost readiness; cold link init not attempted\n");
++	uint32_t ready_mask = su.link_init && initialized ? 0xfeu : 0xffu;
++	if (!(hce & 1u) || (hcs & ready_mask) != (HCS_EXYNOS_RDY & ready_mask)) {
++		printf("STARLTE UFS: HCE initialization lost required host readiness\n");
+ 		su.dead = true;
+ 		return ENXIO;
+ 	}
+@@ -1173,6 +1414,7 @@
+ 		su.dead = true;
+ 		return EBUSY;
+ 	}
++	if (su.link_init) { return exynos_ufs_start_link(initialized); }
+ 	return 0;
+ }
+ 
+@@ -1704,9 +1946,20 @@
+ 		su.syncsecs = UFS_SYNC_SECS;
+ 	}
+ 	if (su.exynos) {
+-		uint32_t probe = 0;
++		uint32_t probe = 0, link_init = 0;
+ 		PE_parse_boot_argn("ufsprobe", &probe, sizeof(probe));
+ 		su.boundary_probe = (probe == 1);
++		PE_parse_boot_argn("ufslinkinit", &link_init, sizeof(link_init));
++		if (link_init > 1 || (link_init && !su.boundary_probe)) {
++			printf("STARLTE UFS: ufslinkinit=1 requires ufsprobe=1\n");
++			return EINVAL;
++		}
++		su.link_init = link_init == 1;
++		if (su.link_init) {
++			uint64_t unipro[2];
++			if (!ufs_dt_read(node, "unipro-reg", unipro, sizeof(unipro)) ||
++			    unipro[0] != 0x11110000 || unipro[1] != 0x8000) { return ENXIO; }
++		}
+ 		su.verify = su.fua = su.syncsecs = 0;
+ 		su.cache = su.wait = su.dmasync = false;
+ 		printf("STARLTE UFS: read-only bring-up (ufsrw ignored), scanning LUNs 0..7\n");
+@@ -1719,6 +1972,10 @@
+ 		if (error) { return error; }
+ 		su.vendor = ml_io_map(0x11121100, 0x200);
+ 		if (!su.vendor) { return ENOMEM; }
++		if (su.link_init) {
++			su.unipro = ml_io_map(0x11110000, 0x8000);
++			if (!su.unipro) { return ENOMEM; }
++		}
+ 	}
+ 
+ 	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+@@ -1762,6 +2019,7 @@
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++	if (!error && su.link_init) { error = exynos_ufs_nop(); }
+ 	if (!error && !su.exynos) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */

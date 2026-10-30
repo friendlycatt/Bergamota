@@ -100,6 +100,7 @@ static void lck_mtx_unlock(int *l) { CHECK(*l == 1); *l = 0; }
 
 /* These declarations are the service boundary of ufs-production.inc. */
 static uint32_t model_rd(uint32_t, bool);
+static uint32_t model_unipro_rd(uint32_t);
 static void model_wr(uint32_t, uint32_t, bool);
 static uint64_t model_smc(void);
 static void model_barrier(void);
@@ -177,6 +178,7 @@ enum fault {
 	OK, TIMEOUT, BAD_OCS, BAD_TYPE, BAD_LUN, BAD_TAG, BAD_RESPONSE, HOST_ERROR,
 	RESIDUAL, UNDERFLOW, OVERFLOW, SENSE, BUSY, FULL, MISSING_DATA, CHANGED_DATA,
 	PENDING_ERROR, COMPLETE_ERROR,
+	MISSING_RESPONSE,
 };
 struct model {
 	bool exynos, unknown_board, node_present, chosen_present;
@@ -187,8 +189,24 @@ struct model {
 	bool fail_alloc, fail_verify_alloc, expect_hold, waiting_hold;
 	bool pending_live, error_sent, uic_read_clear, drop_error_is, complete_on_uic;
 	bool corrupt_on_clear, corrupt_on_ack;
-	bool trace_boundaries, lists_stopped, boundary_fault_sent, boundary_is_read_clear;
+	bool trace_boundaries, trace_through_nop, lists_stopped, boundary_fault_sent, boundary_is_read_clear;
 	bool boundary_hce_off;
+	/* Opt-in controller model: HCE invalidates the link independently of
+	 * its HCS bits; UIC startup and an actual NOP reply restore transport.
+	 * These controls are test inputs, not the production driver's state.
+	 */
+	bool startup_model, allow_link_setup, unipro_mapped, fail_unipro_map;
+	bool link_live, device_ready, drop_dp_on_hce, reset_clocks_on_hce, last_nop;
+	bool uic_pending, uic_stuck, uic_error_sent, uic_error_read_clear;
+	bool stale_completion_stuck, uic_ack_stuck, uic_drop_hce, freeze_counter;
+	uint64_t uic_start, uic_latency, uic_error_delay;
+	uint32_t local_attrs[4], tx_lanes, rx_lanes, connected;
+	uint32_t link_result, link_arg2, link_cnf, uic_result, uic_fault_is, uic_fault_codes[5];
+	uint32_t uic_hcs_clear, uic_busy_reg, uic_ack_error, clock_stuck;
+	unsigned uic_fault_at, uic_commands, uic_sets, uic_gets, link_starts, unipro_reads;
+	unsigned uic_polls, uic_arg_mask, clock_writes, nops, nop_replies;
+	int nop_corrupt_byte;
+	struct { uint32_t command, arg1, arg2, arg3; } uic_history[16];
 	uint64_t smc_result, now, wake, pa, allocation_pa;
 	uint64_t hce_start, hce_latency, hce_completed;
 	uint64_t command_start, error_delay, complete_delay;
@@ -226,7 +244,7 @@ static jmp_buf hold;
 
 static void model_event(char kind, bool vendor, uint32_t off, uint32_t value)
 {
-	if (!m.trace_boundaries || m.commands) { return; }
+	if (!m.trace_boundaries || m.commands > (m.trace_through_nop ? 1u : 0u)) { return; }
 	CHECK(m.pre_event_count < sizeof(m.pre_events) / sizeof(m.pre_events[0]));
 	m.pre_events[m.pre_event_count++] = (typeof(m.pre_events[0])){ kind, vendor, off, value };
 }
@@ -337,6 +355,10 @@ static void reset_model(bool exynos, unsigned block)
 	m.exynos = exynos;
 	m.node_present = m.chosen_present = true;
 	m.fault_op = -1;
+	m.nop_corrupt_byte = -1;
+	m.uic_latency = 2000000;
+	m.tx_lanes = m.rx_lanes = 2;
+	m.connected = 1;
 	m.fault_is = 4;
 	static const uint32_t uic[] = { 0x80000001, 0x80000002, 0x80000004, 0x80000040, 0x80000001 };
 	memcpy(m.fault_uic, uic, sizeof(uic));
@@ -357,6 +379,7 @@ static void reset_model(bool exynos, unsigned block)
 	m.v[0x40 / 4] = 0xa5000010;
 	set_pair("reg", exynos ? 0x11120000 : 0x1d84000, exynos ? 0x200 : 0x1000);
 	set_pair("vendor-reg", 0x11121100, 0x200);
+	set_pair("unipro-reg", 0x11110000, 0x8000);
 	set_pair("dma-pool", 0x81100000, 0x104000);
 	set_pair("loader-image", 0x81000000, 0x300000);
 	const char *compat = exynos ? "samsung,exynos9810-ufs" : "qcom,ufshc";
@@ -405,11 +428,16 @@ static void model_command(void)
 	uint64_t cmd_pa = le64(t + 16);
 	CHECK(!(cmd_pa & 127));
 	uint8_t *cmd = dma_at(cmd_pa, 32);
+	bool nop = cmd[0] == 0;
 	uint32_t len = net32(cmd + 12), direction = (le32(t) >> 25) & 3;
 	CHECK(len <= sizeof(wire));
 	CHECK(le32(t) == (0x11000000u | direction << 25));
 	CHECK(le32(t + 4) == 0 && le32(t + 8) == 15 && le32(t + 12) == 0);
-	CHECK(cmd[0] == 1 && cmd[1] == (len ? (direction == 1 ? 0x20 : 0x40) : 0));
+	CHECK((nop ? m.startup_model : cmd[0] == 1) && cmd[1] == (len ? (direction == 1 ? 0x20 : 0x40) : 0));
+	if (nop) {
+		CHECK(!len && !direction);
+		for (unsigned i = 0; i < 32; i++) { CHECK(!cmd[i]); }
+	}
 	CHECK(direction == (len ? ((cmd[16] == 0x2a) ? 1 : 2) : 0));
 	CHECK(cmd[2] < 8 && cmd[4] == 0 && net32(cmd + 8) == 0);
 	unsigned unit = m.exynos ? 1 : 4;
@@ -418,12 +446,12 @@ static void model_command(void)
 	unsigned stride = m.exynos ? 128 : 16;
 	if (m.exynos) {
 		CHECK(m.smcs == 1 && m.smc_result == 0 && cmd[3] == 0);
-		CHECK(m.v[0x40 / 4] & 1);
+		CHECK((m.v[0x40 / 4] & 1) == (nop ? 0u : 1u));
 		CHECK((m.v[0] & 31) == 12 && (m.v[1] & 31) == 12);
 		CHECK(entries % 128 == 0);
 		entries /= 128;
-		/* Force the next command to set the Nexus bit again. */
-		m.v[0x40 / 4] &= ~1u;
+		/* Force each next request to program its own Nexus type. */
+		m.v[0x40 / 4] ^= 1u;
 	}
 	CHECK(resp_offset >= 32 && resp_size >= 52 && prdt_offset >= resp_offset + resp_size);
 	uint8_t *resp = dma_at(cmd_pa + resp_offset, resp_size);
@@ -448,17 +476,23 @@ static void model_command(void)
 	}
 	CHECK(total == len);
 	m.commands++;
+	m.last_nop = nop;
+	if (nop) { m.nops++; }
 	m.last_prds = entries;
 	m.last_len = len;
 	m.last_op = cmd[16];
-	m.opcount[cmd[16]]++;
-	m.visits |= 1u << cmd[2];
+	if (!nop) {
+		m.opcount[cmd[16]]++;
+		m.visits |= 1u << cmd[2];
+	}
 	memcpy(m.last_cdb, cmd + 16, 16);
 	enum fault fault = OK;
-	if (m.fault_left && (m.fault_op < 0 || m.fault_op == cmd[16])) {
+	if (m.fault_left && (m.fault_op < 0 || m.fault_op == (nop ? 256 : cmd[16]))) {
 		if (m.fault_skip) { m.fault_skip--; }
 		else { fault = m.fault; m.fault_left--; }
 	}
+	/* HCS can look ready after HCE while no link/UTP session exists. */
+	if (m.startup_model && (!m.link_live || (!nop && !m.device_ready))) { fault = TIMEOUT; }
 	if (fault == TIMEOUT || fault == PENDING_ERROR) {
 		m.pending_pa = entries ? spans[0].pa : cmd_pa + resp_offset;
 		m.pending_len = entries ? spans[0].len : 32;
@@ -467,12 +501,20 @@ static void model_command(void)
 		return;
 	}
 	memset(resp, 0, 52);
-	resp[0] = 0x21;
+	resp[0] = nop ? 0x20 : 0x21;
 	resp[2] = cmd[2];
 	resp[3] = cmd[3];
 	put_le32(t + 8, 0);
 	struct disk *d = &m.disks[cmd[2]];
-	if (!d->present || fault == SENSE) {
+	if (nop) {
+		CHECK(m.link_live && !entries && !m.opcount[0]);
+		m.nop_replies++;
+		m.device_ready = true;
+		if (m.nop_corrupt_byte >= 0) {
+			CHECK(m.nop_corrupt_byte < 32);
+			resp[m.nop_corrupt_byte] ^= 1;
+		}
+	} else if (!d->present || fault == SENSE) {
 		resp[7] = 2;
 		resp[11] = 20;
 		resp[33] = 18;
@@ -530,7 +572,8 @@ static void model_command(void)
 	}
 	switch (fault) {
 	case BAD_OCS: put_le32(t + 8, 2); break;
-	case BAD_TYPE: resp[0] = 0x31; break;
+	case BAD_TYPE: resp[0] = nop ? 0x21 : 0x31; break;
+	case MISSING_RESPONSE: memset(resp, 0, 52); break;
 	case BAD_LUN: resp[2] ^= 1; break;
 	case BAD_TAG: resp[3] ^= 1; break;
 	case BAD_RESPONSE: resp[6] = 1; break;
@@ -563,6 +606,16 @@ static void model_enable_progress(void)
 	m.r[0x78 / 4] = m.hce_tm_dbr;
 	m.r[0x60 / 4] = m.hce_rsr;
 	m.r[0x80 / 4] = m.hce_tm_rsr;
+	if (m.startup_model) {
+		m.link_live = m.device_ready = false;
+		memset(m.local_attrs, 0, sizeof(m.local_attrs));
+		if (m.drop_dp_on_hce) { m.r[0x30 / 4] &= ~1u; }
+		if (m.reset_clocks_on_hce) {
+			m.v[0xb4 / 4] |= 0x10;
+			m.v[0xb0 / 4] |= 0x17;
+			m.v[0xfc / 4] &= ~1u;
+		}
+	}
 	m.hce_pending = false;
 	m.hce_completed = m.now;
 }
@@ -571,7 +624,8 @@ static void model_pending_complete(void)
 {
 	uint8_t *resp = m.dma + 0x1200;
 	memset(resp, 0, 16);
-	resp[0] = 0x21;
+	resp[0] = m.last_nop ? 0x20 : 0x21;
+	if (m.last_nop) { m.nop_replies++; m.device_ready = true; }
 	put_le32(m.dma + 8, 0);
 	m.r[0x58 / 4] = 0;
 	m.r[0x20 / 4] |= 1;
@@ -600,19 +654,21 @@ static void model_command_progress(void)
  */
 static void model_boundary_progress(uint32_t off, bool vendor)
 {
-	if (vendor || off != 0x20 || m.commands || !m.lists_stopped) { return; }
+	if (vendor || off != 0x20 || !m.lists_stopped) { return; }
+	if (m.commands && !(m.startup_model && m.commands == m.nops && m.nexus_writes > m.commands)) { return; }
 	if (m.nexus_writes) {
-		/* Independent raw 512-byte-slot TUR layout check, even if no
+		/* Independent raw 512-byte-slot NOP/TUR layout check, even if no
 		 * doorbell is ever submitted. No driver structure offsets used.
 		 */
 		CHECK(le32(m.dma) == 0x11000000 && le32(m.dma + 8) == 15);
 		CHECK(le64(m.dma + 16) == m.pa + 0x1000);
 		CHECK(le32(m.dma + 24) == 0x02000200 && le32(m.dma + 28) == 0x04000000);
-		CHECK(m.dma[0x1000] == 1 && m.dma[0x1001] == 0 && m.dma[0x1010] == 0);
+		CHECK((m.dma[0x1000] == 1 || (m.allow_link_setup && m.dma[0x1000] == 0)) &&
+		    m.dma[0x1001] == 0 && m.dma[0x1010] == 0);
 		for (unsigned i = 0; i < 512; i++) { CHECK(m.dma[0x1200 + i] == 0); }
 	}
-	if (!m.boundary_fault || m.boundary_fault_sent ||
-	    m.boundary_fault != (m.nexus_writes ? 2u : 1u)) { return; }
+	unsigned phase = m.nexus_writes ? (m.dma[0x1000] == 0 ? 3u : 2u) : 1u;
+	if (!m.boundary_fault || m.boundary_fault_sent || m.boundary_fault != phase) { return; }
 	m.boundary_fault_sent = true;
 	m.r[0x20 / 4] |= m.boundary_is;
 	for (unsigned i = 0; i < 5; i++) { m.r[0x38 / 4 + i] = m.boundary_uic[i]; }
@@ -620,6 +676,67 @@ static void model_boundary_progress(uint32_t off, bool vendor)
 	m.r[0x78 / 4] |= m.boundary_tm_dbr;
 	m.r[0x30 / 4] &= ~m.boundary_hcs_clear;
 	if (m.boundary_hce_off) { m.r[0x34 / 4] = 0; }
+}
+
+static bool model_clocks_running(void)
+{
+	return !(m.v[0xb4 / 4] & 0x10) && !(m.v[0xb0 / 4] & 0x17) && (m.v[0xfc / 4] & 1);
+}
+
+static void model_uic_progress(void)
+{
+	if (!m.uic_pending) { return; }
+	uint64_t elapsed = m.now - m.uic_start;
+	bool fault = m.uic_commands == m.uic_fault_at;
+	if (fault && !m.uic_error_sent && elapsed >= m.uic_error_delay) {
+		m.uic_error_sent = true;
+		m.r[0x20 / 4] |= m.uic_fault_is;
+		for (unsigned i = 0; i < 5; i++) { m.r[0x38 / 4 + i] = m.uic_fault_codes[i]; }
+	}
+	if ((fault && m.uic_stuck) || elapsed < m.uic_latency) { return; }
+	const typeof(m.uic_history[0]) *u = &m.uic_history[m.uic_commands - 1];
+	uint32_t result = fault ? m.uic_result : 0;
+	unsigned attr = u->arg1 >> 16;
+	if (u->command == 2) {
+		static const unsigned attrs[] = { 0x3000, 0x3001, 0x4021, 0x4020 };
+		bool found = false;
+		for (unsigned i = 0; i < 4; i++) {
+			if (attr == attrs[i]) { if (!result) { m.local_attrs[i] = u->arg3; } found = true; }
+		}
+		CHECK(found);
+	} else if (u->command == 0x16) {
+		CHECK(!attr && !u->arg3);
+		CHECK(m.local_attrs[0] == 0 && m.local_attrs[1] == 1 && m.local_attrs[2] == 1 && m.local_attrs[3] == 1);
+		m.link_cnf = m.link_result;
+		result = m.link_arg2; /* Samsung's generic register may disagree. */
+		if (!(m.link_cnf & 255)) { m.link_live = true; m.r[0x30 / 4] |= 1; }
+		m.r[0x20 / 4] |= 0x100;
+	} else {
+		CHECK(u->command == 1 && !u->arg3);
+		switch (attr) {
+		case 0x1561: m.r[0x9c / 4] = m.link_live ? m.tx_lanes : 0; break;
+		case 0x1581: m.r[0x9c / 4] = m.link_live ? m.rx_lanes : 0; break;
+		case 0x4020: m.r[0x9c / 4] = m.link_live ? m.connected : 0; break;
+		default: CHECK(false);
+		}
+	}
+	m.r[0x98 / 4] = result;
+	m.r[0x30 / 4] |= 8;
+	if (fault) {
+		m.r[0x30 / 4] &= ~m.uic_hcs_clear;
+		if (m.uic_drop_hce) { m.r[0x34 / 4] = 0; }
+		if (m.uic_busy_reg) { m.r[m.uic_busy_reg / 4] = 1; }
+	}
+	m.r[0x20 / 4] |= 0x400;
+	m.uic_pending = false;
+}
+
+static uint32_t model_unipro_rd(uint32_t off)
+{
+	CHECK(m.allow_link_setup && m.unipro_mapped && off == 0x7854);
+	m.mmio_reads++;
+	m.unipro_reads++;
+	return m.link_cnf;
 }
 
 static uint32_t model_rd(uint32_t off, bool vendor)
@@ -631,6 +748,7 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 		else { m.hce_init_reads++; }
 	}
 	model_enable_progress();
+	model_uic_progress();
 	model_command_progress();
 	model_boundary_progress(off, vendor);
 	uint32_t value = (vendor ? m.v : m.r)[off / 4];
@@ -638,7 +756,7 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 		CHECK(m.exynos); /* No layer-code reads on Qualcomm, even with ufsprobe=1. */
 		if (!m.commands) {
 			CHECK(m.lists_stopped);
-			if (off == 0x38) { CHECK(++m.pre_uic_samples <= 2); }
+			if (off == 0x38) { CHECK(++m.pre_uic_samples <= 2 || m.allow_link_setup); }
 			if (off == 0x48) { m.boundary_last_writes = m.mmio_writes; }
 		}
 		m.uic_reads[(off - 0x38) / 4]++;
@@ -648,7 +766,11 @@ static uint32_t model_rd(uint32_t off, bool vendor)
 	if (!vendor && off == 0x20 && m.drop_error_is && m.commands) {
 		m.r[off / 4] &= ~m.fault_is;
 	}
-	if (!vendor && off == 0x20 && m.boundary_fault_sent && m.boundary_is_read_clear && !m.commands) {
+	if (!vendor && off == 0x20 && m.uic_commands && !m.commands) {
+		m.uic_polls++;
+		if (m.uic_error_read_clear) { m.r[off / 4] &= ~m.uic_fault_is; }
+	}
+	if (!vendor && off == 0x20 && m.boundary_fault_sent && m.boundary_is_read_clear && m.commands == m.nops) {
 		m.r[off / 4] &= ~m.boundary_is;
 	}
 	model_event('r', vendor, off, value);
@@ -672,8 +794,16 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 	m.mmio_writes++;
 	if (vendor) {
 		CHECK(m.exynos);
-		CHECK(off == 0 || off == 4 || off == 0x40); /* no blind PHY/clock/reset writes */
+		bool clock = off == 0xb4 || off == 0xb0 || off == 0xfc;
+		CHECK(off == 0 || off == 4 || off == 0x40 || (m.allow_link_setup && clock));
 		m.vendor_writes++;
+		if (clock) {
+			CHECK(!m.r[0x60 / 4] && !m.r[0x80 / 4] && !m.r[0x58 / 4] && !m.r[0x78 / 4]);
+			CHECK(value == (off == 0xfc ? m.v[off / 4] | 1u :
+			    m.v[off / 4] & ~(off == 0xb4 ? 0x10u : 0x17u)));
+			m.clock_writes++;
+			if (m.clock_stuck == off) { return; }
+		}
 		if (m.prdt_stuck && (off == 0 || off == 4)) { return; }
 		if (m.nexus_stuck && off == 0x40) { return; }
 		if (off == 0x40) { m.nexus_writes++; }
@@ -681,7 +811,29 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 		return;
 	}
 	CHECK(off == 0x20 || off == 0x24 || off == 0x34 || off == 0x50 ||
-	    off == 0x54 || off == 0x58 || off == 0x5c || off == 0x60 || off == 0x80);
+	    off == 0x54 || off == 0x58 || off == 0x5c || off == 0x60 || off == 0x80 ||
+	    (m.allow_link_setup && off >= 0x90 && off <= 0x9c));
+	if (off >= 0x90 && off <= 0x9c) {
+		CHECK(m.exynos && !m.hce_pending && (m.r[0x34 / 4] & 1) && !m.uic_pending);
+		CHECK(!m.r[0x60 / 4] && !m.r[0x80 / 4] && !m.r[0x58 / 4] && !m.r[0x78 / 4]);
+		CHECK(model_clocks_running() && !m.commands && !m.smcs && !m.base_writes);
+		m.r[off / 4] = value;
+		if (off != 0x90) { m.uic_arg_mask |= 1u << ((off - 0x94) / 4); return; }
+		CHECK(m.uic_arg_mask == 7 && !(m.r[0x20 / 4] & 0x400) && (m.r[0x30 / 4] & 8));
+		CHECK(m.uic_commands < 16 && (value == 1 || value == 2 || value == 0x16));
+		CHECK(!(m.r[0x94 / 4] & 0xffff) && !m.r[0x98 / 4]); /* normal/local, selector 0 */
+		m.uic_history[m.uic_commands++] = (typeof(m.uic_history[0])){
+		    value, m.r[0x94 / 4], m.r[0x98 / 4], m.r[0x9c / 4] };
+		if (value == 1) { m.uic_gets++; }
+		if (value == 2) { m.uic_sets++; }
+		if (value == 0x16) { CHECK(++m.link_starts == 1 && m.hce_enables == 1); }
+		m.uic_pending = true;
+		m.uic_error_sent = false;
+		m.uic_start = m.now;
+		m.uic_arg_mask = 0;
+		m.r[0x30 / 4] &= ~8u;
+		return;
+	}
 	if (off == 0x34) {
 		CHECK(m.exynos && value == 1 && !m.hce_pending && !(m.r[off / 4] & 1));
 		CHECK(!m.r[0x60 / 4] && !m.r[0x80 / 4] && !m.r[0x58 / 4] && !m.r[0x78 / 4]);
@@ -696,7 +848,11 @@ static void model_wr(uint32_t off, uint32_t value, bool vendor)
 			m.command_acks++;
 			if (m.corrupt_on_ack) { model_cleanup_corruption(); }
 		}
+		bool completion = (value & m.r[off / 4] & 0x400) != 0;
+		bool fault = m.allow_link_setup && m.uic_commands == m.uic_fault_at;
+		if (m.stale_completion_stuck || (fault && m.uic_ack_stuck)) { value &= ~0x400u; }
 		m.r[off / 4] &= ~value;
+		if (completion && fault) { m.r[off / 4] |= m.uic_ack_error; }
 		return;
 	}
 	if (off == 0x5c) {
@@ -728,6 +884,7 @@ static uint64_t model_smc(void)
 	CHECK(m.exynos && !m.r[0x60 / 4] && !m.r[0x80 / 4]);
 	CHECK(!m.r[0x58 / 4] && !m.r[0x78 / 4]);
 	CHECK(!m.hce_pending && (m.r[0x34 / 4] & 1) && (m.r[0x30 / 4] & 0xff) == 0xf);
+	if (m.allow_link_setup) { CHECK(m.link_live && !m.uic_pending && m.uic_gets == 3); }
 	model_event('s', false, 0, 0);
 	m.smcs++;
 	return m.smc_result;
@@ -745,8 +902,15 @@ static void clean_dcache64(addr64_t pa, uint32_t len, int physical) {
 	flush_dcache64(pa, len, physical);
 }
 static void nanoseconds_to_absolutetime(uint64_t n, uint64_t *out) { *out = n; }
-static uint64_t mach_absolute_time(void) { model_event('t', false, 0, 0); m.now += 1000000; return m.now; }
-static void delay(int us) { CHECK(us >= 0); model_event('d', false, 0, us); m.now += (uint64_t)us * 1000; }
+static uint64_t mach_absolute_time(void) {
+	model_event('t', false, 0, 0);
+	if (!m.freeze_counter || !m.uic_commands) { m.now += 1000000; }
+	return m.now;
+}
+static void delay(int us) {
+	CHECK(us >= 0); model_event('d', false, 0, us);
+	if (!m.freeze_counter || !m.uic_commands) { m.now += (uint64_t)us * 1000; }
+}
 static int assert_wait_deadline_with_leeway(event_t event, int mode, int urgency, uint64_t wake, uint64_t leeway) {
 	m.wake = wake; return THREAD_WAITING;
 }
@@ -778,6 +942,11 @@ static bool PE_parse_boot_argn(const char *name, void *out, unsigned size) {
 	return false;
 }
 static vm_offset_t ml_io_map(vm_offset_t pa, vm_size_t size) {
+	if (m.exynos && pa == 0x11110000 && size == 0x8000) {
+		CHECK(m.allow_link_setup);
+		if (m.fail_unipro_map) { return 0; }
+		m.unipro_mapped = true; return (uintptr_t)&m.link_cnf;
+	}
 	if (m.exynos && pa == 0x11121100 && size == 0x200) {
 		if (m.fail_vendor_map) { return 0; }
 		m.vendor_mapped = true; return (uintptr_t)m.v;
@@ -1312,6 +1481,305 @@ static void probe_to_hold(void)
 	m.expect_hold = true;
 	if (!setjmp(hold)) { dev_t dev; (void)sweet_ufs_rootdev(&dev); CHECK(false); }
 	CHECK(!m.bdevs && !m.cdevs && !m.nodes && !services && !sweet_ufs_lock && !su.ready);
+}
+
+static void warm_probe(bool enabled)
+{
+	reset_model(true, 4096);
+	m.startup_model = m.allow_link_setup = true;
+	m.drop_dp_on_hce = m.reset_clocks_on_hce = true;
+	m.uic_read_clear = true;
+	m.r[0x34 / 4] = enabled;
+	m.link_live = enabled;
+	m.v[0xb4 / 4] = 0x5a5a07f0;
+	m.v[0xb0 / 4] = 0xa5a5001f;
+	m.v[0xfc / 4] = 0x22e;
+	m.v[0x40 / 4] |= 1; /* NOP must actively clear the inherited SCSI Nexus. */
+	arg("ufsprobe", 1); arg("ufslinkinit", 1); arg("ufsrw", 1);
+}
+
+static void warm_quarantine(void)
+{
+	CHECK(su.dead && !su.nop_ready && !su.ready && !su.writable);
+	CHECK(!m.opcount[0] && !m.writes && !m.syncs && !ss.retries);
+	CHECK(occurrences("PROBE HOLD") == 1 && !m.bdevs && !m.nodes);
+	unsigned accesses = m.mmio_reads + m.mmio_writes, commands = m.commands;
+	/* A late UIC completion or DMA cannot resurrect this boot's transport. */
+	m.r[0x34 / 4] = 1; m.r[0x30 / 4] = 0x10f;
+	m.r[0x58 / 4] = m.r[0x78 / 4] = 0;
+	memset(m.dma + 0x1200, 0x39, 32);
+	uint32_t digest = crc32(0, m.dma, m.size), value = 0;
+	dev_t dev = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == EIO && !dev);
+	CHECK(exynos_ufs_uic(1, 0x1561, &value) == EIO && exynos_ufs_nop() == EIO);
+	CHECK(ufs_read_capacity() == EIO);
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && commands == m.commands);
+	CHECK(crc32(0, m.dma, m.size) == digest);
+}
+
+static void test_link_startup(void)
+{
+	for (unsigned state = 0; state < 3; state++) {
+		bool enabled = state == 2;
+		case_name = enabled ? "inherited enabled link receives GET/NOP checks without LINKSTARTUP" :
+		    state ? "HCE-invalidated transport requires startup even when HCS still looks ready" :
+		    "HCE drops Device Present; local CPort/startup/NOP restore readable media";
+		warm_probe(enabled);
+		m.drop_dp_on_hce = state == 0;
+		m.trace_boundaries = m.trace_through_nop = true;
+		probe_to_hold();
+		CHECK(!su.dead && su.nop_ready && su.host_owned && su.boundary_seen == 7);
+		CHECK(m.hce_enables == !enabled && m.link_starts == !enabled && m.unipro_reads == !enabled);
+		CHECK(m.uic_commands == (enabled ? 3u : 8u) && m.uic_gets == 3 && m.uic_sets == (enabled ? 0u : 4u));
+		CHECK(m.nops == 1 && m.nop_replies == 1 && m.opcount[0] == 1 && m.commands > 1);
+		CHECK(su.device_blocks == 0x10000 && su.block_size == 4096 && su.first_block == 0x100 && su.nblocks == 0x2000);
+		CHECK(ss.reads >= 4 && !ss.cmd_failures && !m.writes && !m.syncs && !m.cache_ops);
+		CHECK(m.clock_writes == (enabled ? 3u : 6u) && model_clocks_running());
+		CHECK(m.v[0xb4 / 4] == 0x5a5a07e0 && m.v[0xb0 / 4] == 0xa5a50008 && m.v[0xfc / 4] == 0x22f);
+		CHECK(occurrences("boundary pre-NOP ") == 1 && occurrences("probe PASSED (0)") == 1);
+		static const unsigned attrs[] = { 0x3000, 0x3001, 0x4021, 0x4020, 0, 0x1561, 0x1581, 0x4020 };
+		for (unsigned i = 0; i < m.uic_commands; i++) {
+			unsigned expected = enabled ? i + 5 : i;
+			const typeof(m.uic_history[0]) *u = &m.uic_history[i];
+			CHECK(u->arg1 == attrs[expected] << 16 && !u->arg2);
+			CHECK(u->command == (expected < 4 ? 2u : expected == 4 ? 0x16u : 1u));
+			CHECK(u->arg3 == (expected > 0 && expected < 4 ? 1u : 0u));
+		}
+		/* The first SCSI doorbell still follows the original ten-read TUR
+		 * boundary immediately, even though NOP used this slot first.
+		 */
+		static const unsigned offsets[] = { 0x20, 0x34, 0x30, 0x58, 0x78, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x58 };
+		CHECK(m.pre_event_count > 11);
+		for (unsigned i = 0; i < 11; i++) {
+			const typeof(m.pre_events[0]) *e = &m.pre_events[m.pre_event_count - 11 + i];
+			CHECK(!e->vendor && e->off == offsets[i] && e->kind == (i == 10 ? 'w' : 'r'));
+		}
+		passed(case_name);
+	}
+
+	case_name = "enable-only comparison times out on HCS-ready but invalidated transport";
+	warm_probe(false); m.allow_link_setup = false; m.drop_dp_on_hce = false;
+	m.nargs = 0; arg("ufsprobe", 1); arg("ufslinkinit", 0);
+	probe_to_hold();
+	CHECK(su.dead && !m.uic_commands && !m.nops && m.opcount[0] == 1 && ss.timeouts == 1);
+	CHECK(!m.clock_writes && !m.unipro_mapped);
+	passed(case_name);
+
+	for (unsigned probe = 0; probe < 3; probe++) {
+		case_name = "startup requires exact probe opt-in before any MMIO";
+		warm_probe(false); m.nargs = 0; arg("ufslinkinit", 1);
+		if (probe) { arg("ufsprobe", probe == 1 ? 0 : 2); }
+		dev_t dev = 0;
+		CHECK(sweet_ufs_rootdev(&dev) == EINVAL && !m.mmio_reads && !m.mmio_writes && !m.maps);
+		passed(case_name);
+	}
+	case_name = "non-one startup option is rejected in the read-only hold";
+	warm_probe(false); m.args[1].value = 2;
+	probe_to_hold();
+	CHECK(su.init_error == EINVAL && !m.mmio_reads && !m.mmio_writes);
+	passed(case_name);
+
+	for (unsigned fault = 0; fault < 4; fault++) {
+		case_name = "UniPro window must be exact and mapped before MMIO";
+		warm_probe(false);
+		if (fault == 0) { property(&m.ufs, "unipro-reg")->size = 0; }
+		if (fault == 1) { set_pair("unipro-reg", 0x11120000, 0x8000); }
+		if (fault == 2) { set_pair("unipro-reg", 0x11110000, 0x7854); }
+		if (fault == 3) { m.fail_unipro_map = true; }
+		probe_to_hold();
+		CHECK(su.init_error == (fault == 3 ? ENOMEM : ENXIO) && !m.mmio_reads && !m.mmio_writes);
+		passed(case_name);
+	}
+	case_name = "Qualcomm ignores the Samsung startup option";
+	reset_model(false, 4096); label(&m.disks[0], "userdata");
+	arg("ufsprobe", 1); arg("ufslinkinit", 1); arg("ufsrw", 1);
+	dev_t dev = 0;
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && dev && su.writable && !m.uic_commands && !m.nops && !m.unipro_mapped);
+	passed(case_name);
+}
+
+static void test_uic_failures(void)
+{
+	static const unsigned clocks[] = { 0xb4, 0xb0, 0xfc };
+	for (unsigned i = 0; i < 3; i++) {
+		case_name = "rejected clock control stops before HCE/UIC or DMA";
+		warm_probe(false); m.clock_stuck = clocks[i];
+		probe_to_hold();
+		CHECK(!m.hce_enables && !m.uic_commands && !m.commands && !m.smcs);
+		warm_quarantine(); passed(case_name);
+	}
+	case_name = "stale UIC completion must clear before the first command";
+	warm_probe(false); m.hce_is = 0x400; m.stale_completion_stuck = true;
+	probe_to_hold();
+	CHECK(!m.uic_commands && !m.smcs && !m.commands && occurrences("sent 0 done 0") == 1);
+	warm_quarantine(); passed(case_name);
+	case_name = "cleared stale completion does not replace the new UIC transaction";
+	warm_probe(false); m.hce_is = 0x400;
+	probe_to_hold();
+	CHECK(!su.dead && su.nop_ready && m.uic_commands == 8 && m.uic_polls >= 8);
+	passed(case_name);
+
+	for (unsigned command = 1; command <= 8; command++) {
+		case_name = "every UIC SET/LINKSTARTUP/GET timeout stops the sequence without retry";
+		warm_probe(false); m.uic_fault_at = command; m.uic_stuck = true;
+		probe_to_hold();
+		CHECK(m.uic_commands == command && !m.smcs && !m.commands && !ss.cmd_failures);
+		CHECK(m.now - m.uic_start >= 500000000 && m.now - m.uic_start < 503000000);
+		CHECK(occurrences("done 0") == 1);
+		warm_quarantine(); passed(case_name);
+	}
+	case_name = "UIC timeout has a finite poll budget even with a stopped counter";
+	warm_probe(false); m.uic_fault_at = 1; m.uic_stuck = m.freeze_counter = true;
+	probe_to_hold();
+	CHECK(m.uic_commands == 1 && m.uic_polls == 5000 && m.now == m.uic_start);
+	warm_quarantine(); passed(case_name);
+
+	for (unsigned command = 1; command <= 8; command++) {
+		if (command == 5) { continue; }
+		case_name = "nonzero DME attribute result prevents NOP/SCSI";
+		warm_probe(false); m.uic_fault_at = command; m.uic_result = 1;
+		probe_to_hold();
+		CHECK(m.uic_commands == command && !m.smcs && !m.commands);
+		warm_quarantine(); passed(case_name);
+	}
+	case_name = "LINKSTARTUP uses successful UniPro confirmation despite generic ARG2 failure";
+	warm_probe(false); m.link_arg2 = 7; m.link_result = 0x1200;
+	probe_to_hold();
+	CHECK(!su.dead && su.nop_ready && m.unipro_reads == 1 && occurrences("result 0 arg2 7") == 1);
+	passed(case_name);
+	case_name = "failed UniPro confirmation cannot be hidden by successful generic ARG2";
+	warm_probe(false); m.link_result = 7;
+	probe_to_hold();
+	CHECK(m.uic_commands == 5 && m.unipro_reads == 1 && !m.smcs && !m.commands);
+	warm_quarantine(); passed(case_name);
+
+	for (unsigned fault = 0; fault < 8; fault++) {
+		case_name = "UIC completion with readiness/list/acknowledgement failure quarantines";
+		warm_probe(false); m.uic_fault_at = 8;
+		if (fault == 0) { m.uic_hcs_clear = 8; }
+		if (fault == 1) { m.uic_drop_hce = true; }
+		if (fault >= 2 && fault <= 5) {
+			static const unsigned regs[] = { 0x58, 0x78, 0x60, 0x80 };
+			m.uic_busy_reg = regs[fault - 2];
+		}
+		if (fault == 6) { m.uic_ack_stuck = true; }
+		if (fault == 7) { m.uic_ack_error = 0x10000; }
+		probe_to_hold();
+		CHECK(m.uic_commands == 8 && !m.smcs && !m.commands);
+		warm_quarantine(); passed(case_name);
+	}
+	for (unsigned lane = 0; lane < 5; lane++) {
+		case_name = "invalid connected lanes/CPort prevent request-list setup";
+		warm_probe(false);
+		if (lane == 0) { m.tx_lanes = 0; }
+		if (lane == 1) { m.tx_lanes = 3; }
+		if (lane == 2) { m.rx_lanes = 0; }
+		if (lane == 3) { m.rx_lanes = 3; }
+		if (lane == 4) { m.connected = 0; }
+		probe_to_hold();
+		CHECK(m.uic_gets == 3 && !m.smcs && !m.base_writes && !m.nops);
+		warm_quarantine(); passed(case_name);
+	}
+
+	case_name = "only completed successful LINKSTARTUP consumes its exact PA LINERESET";
+	warm_probe(false); m.uic_fault_at = 5; m.uic_fault_is = 4; m.uic_fault_codes[0] = 0x80000010;
+	m.uic_error_read_clear = true; /* completion must not hide the earlier IS */
+	probe_to_hold();
+	CHECK(!su.dead && su.nop_ready && occurrences("UIC setup IS 00000504") == 1);
+	CHECK(!m.r[0x38 / 4] && !m.r[0x20 / 4] && !ss.is_errors);
+	passed(case_name);
+	for (unsigned fault = 0; fault < 10; fault++) {
+		case_name = "LINERESET allowance excludes failed/incomplete/non-startup and other errors";
+		warm_probe(false); m.uic_fault_at = 5; m.uic_fault_is = 4; m.uic_fault_codes[0] = 0x80000010;
+		if (fault == 0) { m.link_result = 1; }
+		if (fault == 1) { m.uic_stuck = true; }
+		if (fault == 2) { m.uic_fault_at = 4; }
+		if (fault == 3) { m.uic_fault_at = 6; }
+		if (fault == 4) { m.uic_fault_codes[0] |= 1; }
+		if (fault >= 5 && fault <= 8) { m.uic_fault_codes[fault - 4] = 0x80000001; }
+		if (fault == 9) { m.uic_fault_is |= 0x10000; }
+		probe_to_hold();
+		CHECK(m.uic_commands == m.uic_fault_at && !m.smcs && !m.nops);
+		warm_quarantine(); passed(case_name);
+	}
+	for (unsigned layer = 0; layer < 5; layer++) {
+		case_name = "nonzero UIC layer code is rejected even without IS.UIC_ERROR";
+		warm_probe(false); m.uic_fault_at = 8; m.uic_fault_codes[layer] = 1;
+		probe_to_hold();
+		CHECK(!m.smcs && !m.nops);
+		warm_quarantine(); passed(case_name);
+	}
+}
+
+static void test_nop(void)
+{
+	case_name = "SCSI is refused before NOP without touching descriptors or MMIO";
+	transport(true, 4096); su.link_init = true;
+	unsigned accesses = m.mmio_reads + m.mmio_writes;
+	uint32_t digest = crc32(0, m.dma, m.size);
+	CHECK(ufs_read_capacity() == EIO && !m.commands && !su.nop_ready);
+	CHECK(accesses == m.mmio_reads + m.mmio_writes && crc32(0, m.dma, m.size) == digest);
+	passed(case_name);
+
+	for (unsigned boundary = 1; boundary <= 3; boundary++) {
+		case_name = "PA LINERESET at pre-enable/pre-NOP/pre-TUR still stops before the next doorbell";
+		warm_probe(false); m.boundary_fault = boundary;
+		m.boundary_is = 4; m.boundary_uic[0] = 0x80000010;
+		m.boundary_is_read_clear = true;
+		probe_to_hold();
+		CHECK(su.dead && !m.opcount[0] && m.nops == (boundary == 2 ? 1u : 0u));
+		CHECK(!ss.cmd_failures && !ss.timeouts && !m.writes && !ss.retries);
+		if (boundary == 2) { CHECK(su.nop_ready); } else { warm_quarantine(); }
+		passed(case_name);
+	}
+	for (unsigned fault = 0; fault < 4; fault++) {
+		case_name = "pre-NOP host/device/task readiness is checked before submission";
+		warm_probe(false); m.boundary_fault = 3;
+		if (fault == 0) { m.boundary_hce_off = true; }
+		if (fault == 1) { m.boundary_hcs_clear = 1; }
+		if (fault == 2) { m.boundary_tm_dbr = 1; }
+		if (fault == 3) { m.boundary_dbr = 1; }
+		probe_to_hold();
+		CHECK(!m.commands && !ss.cmd_failures);
+		warm_quarantine(); passed(case_name);
+	}
+
+	static const enum fault nop_faults[] = { BAD_OCS, BAD_TYPE, BAD_TAG, BAD_LUN, BAD_RESPONSE, MISSING_RESPONSE, HOST_ERROR };
+	for (unsigned i = 0; i < sizeof(nop_faults) / sizeof(nop_faults[0]); i++) {
+		case_name = "NOP IN requires OCS, transaction, task tag and a real valid response";
+		warm_probe(false); inject(nop_faults[i], 1, 256);
+		probe_to_hold();
+		CHECK(m.nops == 1 && m.commands == 1 && ss.cmd_failures == 1);
+		warm_quarantine(); passed(case_name);
+	}
+	static const unsigned nop_fields[] = { 1, 4, 5, 7, 8, 10, 11, 12, 31 };
+	for (unsigned i = 0; i < sizeof(nop_fields) / sizeof(nop_fields[0]); i++) {
+		case_name = "NOP IN flags/EHS/data length/reserved fields cannot masquerade as a handshake";
+		warm_probe(false); m.nop_corrupt_byte = nop_fields[i];
+		probe_to_hold();
+		CHECK(m.nops == 1 && m.commands == 1 && ss.cmd_failures == 1);
+		warm_quarantine(); passed(case_name);
+	}
+	case_name = "NOP requires clearing the SCSI Nexus bit";
+	warm_probe(false); m.nexus_stuck = true;
+	probe_to_hold();
+	CHECK(!m.commands && !ss.cmd_failures);
+	warm_quarantine(); passed(case_name);
+	for (unsigned fault = 0; fault < 3; fault++) {
+		case_name = "NOP timeout/late completion uses permanent quarantine and bounded positive-bit cleanup";
+		warm_probe(false); inject(fault == 2 ? PENDING_ERROR : TIMEOUT, 1, 256);
+		m.sticky_dbr = fault == 1;
+		if (fault == 2) {
+			m.fault_is = 4; memset(m.fault_uic, 0, sizeof(m.fault_uic)); m.fault_uic[0] = 0x80000010;
+			m.drop_error_is = true; m.complete_delay = 8000000;
+		}
+		probe_to_hold();
+		CHECK(m.nops == 1 && m.commands == 1 && ss.cmd_failures == 1);
+		CHECK(ss.timeouts == (fault < 2) && m.clears == (fault < 2));
+		if (fault < 2) { CHECK(m.clear_value == 1 && m.now - m.command_start < 5110000000ull); }
+		else { CHECK(m.nop_replies == 1 && ss.is_errors == 1); }
+		warm_quarantine(); passed(case_name);
+	}
 }
 
 static void boundary_probe(void)
@@ -1874,6 +2342,9 @@ int main(int argc, char **argv)
 	test_failures();
 	test_diagnostics();
 	test_boundaries();
+	test_link_startup();
+	test_uic_failures();
+	test_nop();
 	test_capacity();
 	test_gpt();
 	test_handoff();

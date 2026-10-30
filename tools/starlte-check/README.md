@@ -200,15 +200,15 @@ synthetic GPT/media fixtures with zlib CRCs. Host execution uses ASan/UBSan
 with **`-fno-sanitize-recover=all`**, so a sanitizer finding fails the command.
 
 The runner extracts production transport, retry, capacity, GPT, partition
-lookup, initialization, probe and BSD functions. Only five function bodies
-are replaced: `ufs_rd`, `ufs_wr`, `exynos_rd`, `exynos_wr` and
-`exynos_fmp_format`. The host adapter supplies MMIO/SMC results, barriers,
+lookup, initialization, probe and BSD functions. Only six function bodies
+are replaced: `ufs_rd`, `ufs_wr`, `exynos_rd`, `exynos_wr`,
+`exynos_unipro_rd` and `exynos_fmp_format`. The host adapter supplies MMIO/SMC results, barriers,
 time/waits, locks, DMA allocation/mapping, ADT/boot arguments, BSD buffers and
 device/peripheral registration. The complete `sweet_ufs.c` is separately
 compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
 `BSD_KERNEL_PRIVATE`; extraction hashes are recorded in `summary.json`.
 
-**236 host scenarios** exercise:
+**329 host scenarios** exercise:
 
 * Samsung byte-granular descriptors, 128-byte crypto-bypass PRDs, per-command
   Nexus setup, inherited host/list checks, SMC/setup refusal and DMA bounds.
@@ -217,7 +217,21 @@ compiled to Mach-O with real DEVELOPMENT/ARM64/SWEET headers and
   One enable-only attempt requires stopped/idle lists; a 1 ms write-echo guard
   and at most ten 5 ms delays cover immediate/transitional completion, timeout
   and late completion. Readiness/error/list-state loss prevents FMP and commands.
-  MMIO write allowlists exclude blind PHY/clock/reset or UIC command writes.
+  MMIO write allowlists admit clock/UIC operations only in the explicit startup
+  model; device-reset and PHY programming remain excluded.
+* The `ufsprobe=1 ufslinkinit=1` startup candidate: HCE independently invalidates
+  transport, including a ready-looking HCS case. Local CPort SETs, one
+  LINKSTARTUP with Samsung direct UniPro confirmation, connected-lane/CPort
+  GETs and a correctly encoded NOP OUT/IN precede SCSI. Already-enabled hosts
+  receive GET/NOP checks without LINKSTARTUP. Exact opt-in/mapping, masked
+  clock controls before/after HCE, each UIC-stage timeout, frozen-counter poll
+  bounds, stale/failed acknowledgements and direct/generic result disagreement
+  are exercised. Only the exact PA LINERESET indication accompanying successful
+  completed LINKSTARTUP is permitted; other stages/errors and all transfer
+  boundaries reject it. Missing/malformed NOP replies, Nexus readback failure,
+  pre-NOP readiness loss and late DMA quarantine prevent SCSI. Independent raw
+  NOP/TUR bytes select boundary fault injection; tracing extends through NOP to
+  verify the original immediate pre-TUR read/doorbell ordering.
 * Read-only opcode enforcement even with `ufsrw=1`, timeout-clear polarity,
   late-DMA quarantine, initialization-failure caching, response validation,
   partial-transfer rejection and bounded transient retries.
@@ -261,10 +275,13 @@ clock/PHY/link state, secure-firmware acceptance, cache/interconnect behavior,
 real DMA access or readable media. Probe 2 physically enabled HCE and observed
 the FMP format call returning zero, but its first TEST UNIT READY timed out with
 UIC_ERROR. Probe 3 physically recorded first PA `0x80000010`, terminal PA=0,
-IS=4/DBR=1/OCS=0x0f before cleanup; cause/timing remain unclassified. Patch 1135's
-pre-submit experiment is locally validated in `research/starlte/ufs-probe-4-check/`
-and exactly reconstructed in `research/starlte/series-check-ufs-probe-4/`;
-new CI/image and its physical probe remain pending.
+IS=4/DBR=1/OCS=0x0f before cleanup; cause/timing remain unclassified. The startup
+candidate is validated in the `starlte/ufs-link-startup` worktree's
+`research/starlte/link-startup-check-1/` and exactly reconstructed in
+`research/starlte/series-check-link-startup-retry1/` (279 patches / 6369 files).
+The first reconstruction's BearSSL DNS failure is retained separately. These
+checks model transport behavior; a candidate CI image and physical result are
+still required. Main-checkout probe 4 remains pinned to source `2347574`.
 
 ### Reset and final framebuffer: `reset.py`
 

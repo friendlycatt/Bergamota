@@ -357,6 +357,8 @@ def build(seed=None, qemu=False, highmem=False, board='sweet', display_scale=3, 
         ('reg', u64(0x11120000, 0x200) if board == 'starlte' else u64(UFS, UFS_SIZE)),
     ] + ([
         ('vendor-reg', u64(0x11121100, 0x200)),
+        # Samsung GET_GENERRCODE_DIRECT: LINKSTARTUP confirmation at +0x7854.
+        ('unipro-reg', u64(0x11110000, 0x8000)),
         # Enxerto fills these only in the copied ADT, using its own loaded
         # Image's DMA arena. Zero placeholders cannot initialize the host.
         ('dma-pool', u64(0, 0)),

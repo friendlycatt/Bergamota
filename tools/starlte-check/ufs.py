@@ -40,6 +40,7 @@ def host_source(xnu, out):
         'ufs_wr': 'model_wr(off, v, false);',
         'exynos_rd': 'return model_rd(off, true);',
         'exynos_wr': 'model_wr(off, v, true);',
+        'exynos_unipro_rd': 'return model_unipro_rd(off);',
         'exynos_fmp_format': 'return model_smc();',
     }
     boundary = {}
@@ -92,6 +93,8 @@ def loader_checks(out):
     dll.adt_ufs_dma.argtypes = [ctypes.c_size_t] + [ctypes.c_uint64] * 7
     dll.adt_ufs_dma.restype = ctypes.c_int
     tree = build_tree(board='starlte')
+    ufs = next(n for n in tree.children if n.name == 'sweet-ufs')
+    assert ufs.prop('unipro-reg') == struct.pack('<QQ', 0x11110000, 0x8000)
     original = adt.serialize(tree)
     expected = fill_dma(tree, 0x81000000, 0x81300000, 0x81100000)
     args = [len(original), 0x81000000, 0x81300000, 0x81100000, 0x104000,
