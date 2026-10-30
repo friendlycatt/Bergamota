@@ -15,7 +15,10 @@ requiring current fixed-format sense, valid lengths/identity and a fresh clean
 host/list/base/UIC sample. Persistent UA and other OCS errors still quarantine.
 Local checks pass **527 host / 24 ADT / fatal sanitizers / real-header compile**;
 fresh reconstruction passes **281 patches / 6369 files**, including the complete
-pre-1138 baseline. New CI/image and physical capacity/GPT/reads remain pending.
+pre-1138 baseline. Source **db22b20** is committed/pushed and Intel CI
+**[41134708958](https://github.com/friendlycatt/Bergamota/actions/runs/41134708958)**
+is dispatched. Build result, replacement image and physical capacity/GPT/reads
+remain pending.
 
 **Previous failure, 2026-10-30:** the [startup-candidate photograph](#photographed-startup-candidate-result)
 stops **before HCE enable**, with **IS=0 / HCE=0 / HCS=0x10f / idle DBRs /
