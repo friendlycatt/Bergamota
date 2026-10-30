@@ -4,15 +4,16 @@ Target: Samsung Galaxy S9 **starlte** (Exynos9810, SM-G960F / G960FD),
 using Bergamota's iOS 26 / XNU12377 stack. The Snapdragon S9 and S9+ have
 different board descriptions.
 
-**Status, 2026-10-30:** [UFS probe 2](#ufs-probe-2-software-delivery) is finalized
-and independently verified, ready for the phone test. Intel XNU26 CI
-**40955206538** succeeded; all **148 manifest entries / 149 archive files** match.
-Its bounded HCE enable-only correction addresses the
-[probe-1 photograph](#photographed-ufs-probe-1-result): physical XNU accepted the
-DMA handoff, then stopped at **`host not ready (hce 0x0 hcs 0x10f)` / FAILED (6) /
-PROBE HOLD**, before FMP setup or storage commands. Local transport/compilation
-checks and the audited QEMU failure hold pass; **Samsung media reads and an iOS
-root mount remain unverified**. The physical
+**Status, 2026-10-30:** the [probe-2 photograph](#photographed-ufs-probe-2-result)
+shows the bounded **HCE enable succeeded** (`HCE=1`, `HCS=0x10f`, `IS=0`) and
+the **FMP format call returned 0**. The first TEST UNIT READY command then
+**timed out with `IS=0x4` (UIC_ERROR)**: **FAILED (60), zero writes / PROBE HOLD**.
+The next probe needs layer-error and request/descriptor diagnostics before
+cleanup. **Samsung media reads and an iOS root mount remain unverified**.
+The [probe-2 delivery](#ufs-probe-2-software-delivery) and Intel XNU26 CI
+**40955206538** are verified; all **148 manifest entries / 149 archive files**
+match. Local transport/compilation checks and the audited QEMU failure hold pass.
+The physical
 [display probe](#display-probe-1) reached **PROBE READY**, and the full XNU26
 CI build and QEMU VM/CPU/IOKit initialization are verified. Timer delivery,
 touch, Mali GPU, USB and power-management support remain follow-up work.
@@ -520,8 +521,9 @@ The [pinned Samsung driver][samsung-ufs] and DTS identify:
 | Request quirks | Positive-bit `UTRLCLR`; vendor Nexus register offset `0x40` | Clear slot 0 with `1`; set and verify its Nexus bit before every command |
 | DMA addressing | Initial `DMA_BIT_MASK(32)`; `ufshcd_set_dma_mask()` can select 64-bit addressing when CAP.64AS permits | Use an Image-owned DMA32 arena even though XNU manages upper RAM |
 
-Actual DMA64 capability, link/clocks and secure-firmware acceptance are still
-unmeasured. The implementation reuses inherited host/link configuration; it
+Probe 2 observes a zero return from the descriptor-format SMC. Actual data DMA,
+descriptor acceptance and the failing link's condition remain unmeasured.
+The implementation reuses inherited host/link configuration; it
 does not initialize the Exynos PHY or recover a failed link.
 
 ### Read-only Samsung UFS
@@ -848,12 +850,57 @@ bundle, under `research/starlte/ufs-probe-2-bringup/`:
 `independent-audit/delivery.py` and
 `ci-40955206538-delivery-independent-review.json`. Delivery bytes are unchanged.
 
-Use the selected **TWRP / OrangeFox** test-image route. Photograph the **whole
-screen**, including inherited host state, **HCE enable-only attempt/result**,
-FMP, LUN/capacity, GPT/repeated sample, write/failure counters and **PROBE HOLD**.
-If it stalls earlier, capture the last visible line. The next result is this
-physical test; Samsung media reads remain the prerequisite for preparing the
-iOS26 root. No assistant phone writes or Apple root downloads occurred.
+The user tested this delivery through the selected **TWRP / OrangeFox** route;
+the new result is below. Samsung media reads remain the prerequisite for
+preparing the iOS26 root.
+
+### Photographed UFS probe 2 result
+
+The user photograph received **2026-10-30** shows:
+
+```text
+STARLTE UFS: HCE enable-only attempt (inherited ready, idle lists)
+STARLTE UFS: HCE enable result hce 0x1 hcs 0x10f is 0x0
+STARLTE UFS: FMP DESCTYPE 3 result 0x0, TX/RX 0xc/0xc nexus 0xffff
+SWEET UFS: command 0x00 timed out (is 0x4 hcs 0x10f dbr 0x0)
+STARLTE UFS: LUN 0 scan result 60 (host stopped)
+STARLTE UFS: probe FAILED (60), writes 0, commands failed 1
+STARLTE UFS: PROBE HOLD - photograph this screen, then reboot to recovery
+```
+
+Runtime DMA is **`0x80208000+0x104000`**, inside the Image mapping
+**`0x80164000+0x1ac000`**. Inherited CAP is **`0x1303ff0f`**, version **`0x210`**,
+transfer/task DBRs **0**, both RSRs **1**, TX/RX **`0xc/0xc`**, Nexus **`0xffff`**,
+SWRST **0**, GPIO **1**, CLKSTOP **0**, FORCE **`0xae0`**. These are runtime
+observations, not addresses or settings to hardcode.
+
+This physically corroborates the HCE correction and the SMC's zero return.
+**TEST UNIT READY (`0x00`) transfers no media data**, so it establishes neither
+PRDT/data-DMA acceptance nor readable storage. There is no capacity/GPT/sample,
+root mount or userspace result yet. No installed-image checksum was supplied.
+The original JPEG was located and directly viewed; its byte-exact copy,
+hash/provenance and qualified transcription are under ignored
+`research/starlte/device-ufs-probe-2/`.
+
+**Source interpretation:** [Samsung `ufshci.h`][samsung-ufshci]:118 defines
+**`IS=0x4` as UIC_ERROR**. Registers **`0x38/0x3c/0x40/0x44/0x48`** hold raw
+PA/DL/NL/TL/DME layer codes. [`ufshcd.c`][samsung-ufshcd]:5392–5458 uses the
+specific codes to distinguish recovery cases; `IS=0x4` alone does not select
+a reset/retry policy. The current UFSHCI 2.1 command type **1** and per-command
+Nexus setup agree with the reference; no particular descriptor-format bug has
+been established.
+
+The current timeout path writes `UTRLCLR` **before** printing DBR, and replaces
+the recorded OCS with `0xff`. Thus **DBR=0 is post-cleanup**, not evidence of
+natural completion. The `host stopped` suffix means software quarantine
+(`su.dead`), not a measured hardware/list stop. The next additive probe will
+capture first-error and terminal request/UIC/descriptor state before cleanup,
+with bounded output and continued DMA quarantine.
+
+Baseline driver/tests and completed probe-1/probe-2 evidence are preserved in
+fresh `research/starlte/ufs-probe-3-bringup/`: seven source/documentation copies,
+351 prior source hashes and **498 protected artifacts**. At this observation
+milestone, no probe-3 driver patch, CI run or image has been produced.
 
 ## Getting-started guide review for S9
 
@@ -919,12 +966,12 @@ new UFS probe above.
 
 ## Next milestones
 
-1. **Read-only Samsung storage.** Test the finalized
-   [probe-2 image](#ufs-probe-2-software-delivery) and capture the bounded HCE
-   enable-only result. Obtain actual LUN capacity/GPT and repeated userdata reads
+1. **Read-only Samsung storage.** Diagnose the photographed first-command
+   UIC timeout with a bounded pre-cleanup diagnostic probe. Obtain actual LUN
+   capacity/GPT and repeated userdata reads
    before preparing the iOS26 root. A userdata write needs explicit confirmation.
-2. **Complete the physical XNU record.** The probe-1 photograph establishes
-   XNU UFS initialization/failure hold, not a root mount or userland boot.
+2. **Complete the physical XNU record.** Probe 2 establishes HCE enable and
+   the FMP return, followed by a first-command UIC timeout and failure hold.
    Capture whole-screen results of subsequent tests, including the last visible
    line if enable or storage discovery stalls.
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
