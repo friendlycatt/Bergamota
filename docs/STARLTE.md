@@ -15,9 +15,10 @@ on `starlte/ufs-link-startup`, addresses the missing post-HCE transport sequence
 **329 host scenarios / 24 ADT cases / real-header compile** and
 **279-patch / 6369-file reconstruction PASS**. Source **ec7a619** is pushed;
 [Intel CI 41092452347](https://github.com/friendlycatt/Bergamota/actions/runs/41092452347)
-completed successfully on attempt 1. The candidate loader/ADTs and **6374 pre-fixed expected CI source
-hashes** are prepared; kernel inspection, image packaging and physical validation
-are next.
+completed successfully on attempt 1. All **6374 pre-fixed CI source hashes**
+and the actual kernel verify. The **10463248-byte startup/NOP image** is packaged,
+independently raw-audited and finalized. The corrected QEMU audit verifies the
+expected missing-node hold; **the image is ready for the S9 test photograph**.
 Probe 4's [boundary experiment](#selected-next-read-only-experiment)
 remains pinned to **2347574 / CI 41072462470** in the main checkout.
 **Samsung media reads and an iOS root mount
@@ -1356,22 +1357,65 @@ Probe-4's main-checkout source and fixed CI expectations remain pinned independe
 
 Candidate delivery preparation passed **16:59:49Z**. **`link-startup-delivery/`**
 contains the checked normal **1740800-byte** Image/ELF and fresh hardware/QEMU
-ADTs. The hardware tree includes the exact UniPro region; payloads will use
+ADTs. The hardware tree includes the exact UniPro region; payloads use
 **`ufsprobe=1 ufslinkinit=1`**. All **355 tracked source hashes / 1108 protected
 prior files** verify. The **6374-file** CI expectation inventory was fixed
 before any new artifact download or archive read, using the local reconstruction,
 six pinned build-script substitutions and nine prior-reviewed header copies.
 Its SHA256 is **`8744dac99cc42080fdba80d7c70f3e6a438ceebe036938b6a0708ef15b11b3be`**.
 The delivery suite preserves the established exception and snapshot policies;
-their six implementation helpers are unchanged. Download/CI inspection, actual
-image packaging and a new full-kernel QEMU capture are still pending.
+their six implementation helpers are unchanged. Completed CI inspection,
+packaging, QEMU and finalization results follow.
 
 CI **41092452347 / ec7a619 / attempt 1** completed successfully **17:18:24Z**,
 job **124189568585**. Its build step ran **16:43:55–17:15:44Z**; actual host
 selection is **x86_64 / Xcode 26.1.1 / 17B100**. The completed watcher saved
 the final run, job, artifact metadata and Actions log. Recorded artifact IDs
-**12996987051** (kernel) and **12995539243** (buildtree) are being downloaded
+**12996987051** (kernel) and **12995539243** (buildtree) were downloaded
 and verified against their GitHub ZIP digests and the pre-fixed source inventory.
+Full replay/source/binary inspection passed **17:26:19Z**, with all **6374 files /
+279 patches / 34 UFS markers** exact. The kernel is **22213896 bytes**,
+SHA256 **`0fb57682ca379bd7c17a123785feed6f1c86752aeea303d75bbbf507ae794183`**.
+
+Packaging and independent raw-image/payload verification passed **17:41:18Z /
+17:43:07Z**. Candidate image **`enxerto/out/starlte/boot-starlte-ufs-link-startup.img`**
+is **10463248 bytes**, SHA256
+**`35e25f0d397158b58112c2324f4d102edbb9da5b14b3effc89dfae453fdc8187`**,
+with adjacent `.img.sha256`. The production host loader compares **43778048 RAM
+bytes exact**; the raw audit verifies all loaded CI segments, ADT configuration,
+Samsung template metadata, DTBH/footer and legacy SHA-1.
+
+QEMU's first launch was rejected before guest execution because the worktree's
+Unix socket path was too long. The failed capture and exact original scripts
+are preserved. A fresh **`link-startup-qemu-41092452347-retry1/`** capture through
+**`/tmp/opencode/uls-41092452347`** completed **17:54:56Z**, checker exit **0**:
+**90 seconds / 7078 console bytes / 6905 IRQs + one verified retried Skywalk
+demand fault / rootvnode=0 / early_panicking=0 / `_cpu_idle + 0x220`**.
+The actual screenshot shows the expected missing-`/sweet-ufs` **FAILED (6),
+writes 0, commands failed 0 / PROBE HOLD**. The underlying runner remains
+**3 / `blank_screen`**, reflecting its colored-console decoder limitation.
+Independent QEMU audit passed **18:04:36Z**, preserving both established policies:
+**`irq-or-one-retried-skywalk-demand-fault-v1`** and
+**`idle-or-verified-gicv2-timer-ack-v2`**. QEMU has no Samsung UFS device; physical
+startup/NOP/TUR acceptance remains unverified.
+
+Actual **`finish_delivery.py`** completed successfully **18:04:42Z**.
+**`research/starlte/link-startup-delivery/`** contains the final receipt
+**`delivery-final.json`**, README, reproduction scripts and verified **60-entry
+`SHA256SUMS`**, manifest SHA256
+**`1ba06e42b359f9c1a96721770248a375f4e52c1bd063c22498337fc63e889b2a`**.
+The final receipt supersedes initial packaging status in `delivery.json`.
+The ready-to-test image is:
+
+```text
+/home/friendlycatt/Bergamota/research/starlte/ufs-link-startup-work/enxerto/out/starlte/boot-starlte-ufs-link-startup.img
+```
+
+Use the existing **TWRP / OrangeFox** Samsung boot-image procedure. Photograph
+the complete held UFS output, especially **warm-link/UIC, NOP result, boundaries,
+capacity/GPT/read CRC and final counters**. If it stops earlier, capture the last
+visible line. Measured Samsung capacity/GPT and repeated userdata reads are
+required before root preparation.
 
 ## Getting-started guide review for S9
 
