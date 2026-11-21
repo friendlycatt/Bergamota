@@ -20,8 +20,11 @@ pre-1138 baseline. Source **db22b20** is committed/pushed and Intel CI
 **succeeded**, attempt 1, job **124334184763**, complete **22:34:30Z**. Fresh
 delivery inputs and all **6374 expected source hashes** are pinned before download,
 inventory **`8180b06464093bf5ccb9946191c4153eed613043c043fb480d5dbb1372ac0248`**.
-Artifact inspection and replacement packaging are underway; physical
-capacity/GPT/reads remain pending.
+All **6374 actual CI source hashes / 281 patches / 38 UFS markers** verify.
+The **10463248-byte [TUR-retry image](#tur-reset-ua-correction-delivery)** is
+packaged, independently raw-audited, QEMU-checked and finalized; independent
+delivery verification passes **2026-11-21T07:53:00Z** with a **64-entry**
+manifest. Physical capacity/GPT/reads remain pending.
 
 **Previous failure, 2026-10-30:** the [startup-candidate photograph](#photographed-startup-candidate-result)
 stops **before HCE enable**, with **IS=0 / HCE=0 / HCS=0x10f / idle DBRs /
@@ -69,8 +72,9 @@ fallback in patch 1019. The platform and storage work is in
 [`1133-starlte-enable-inherited-ufs-host.patch`](../xnu/patches-12377/1133-starlte-enable-inherited-ufs-host.patch),
 [`1134-starlte-ufs-precleanup-diagnostics.patch`](../xnu/patches-12377/1134-starlte-ufs-precleanup-diagnostics.patch),
 [`1135-starlte-ufs-presubmit-boundaries.patch`](../xnu/patches-12377/1135-starlte-ufs-presubmit-boundaries.patch),
-[`1136-starlte-ufs-link-startup.patch`](../xnu/patches-12377/1136-starlte-ufs-link-startup.patch)
-and [`1137-starlte-ufs-preenable-linereset.patch`](../xnu/patches-12377/1137-starlte-ufs-preenable-linereset.patch),
+[`1136-starlte-ufs-link-startup.patch`](../xnu/patches-12377/1136-starlte-ufs-link-startup.patch),
+[`1137-starlte-ufs-preenable-linereset.patch`](../xnu/patches-12377/1137-starlte-ufs-preenable-linereset.patch)
+and [`1138-starlte-ufs-tur-reset-ua.patch`](../xnu/patches-12377/1138-starlte-ufs-tur-reset-ua.patch),
 applied after the existing series with `MACHINE_CONFIG=SWEET`.
 The active handoff and local artifact paths are in [`NOTES.md`](../NOTES.md).
 
@@ -363,8 +367,8 @@ translation support.
 | Starlte Enxerto build | PASS, 1740800-byte normal Image including DMA arena; header size/magic verified, no ABS64 relocations in C objects |
 | Existing-board regressions | sweet/beryllium: 798720-byte Images, boot headers v2/v1, kernel/DTB roundtrips, 511 fastboot checks each; packaging used QEMU DTBs |
 | ADT regression | Four sweet/beryllium hardware fixtures byte-identical to baseline; four default QEMU fixtures differ only by added PSCI HVC nodes |
-| UFS (`ufs.py`) | PASS, 501 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing and deferred boundary output |
-| Ordered patch reconstruction | PASS: pre-HCE correction four-stage / 280-patch reconstruction, 6369 files and complete pre-1137 baseline exact; fresh CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
+| UFS (`ufs.py`) | PASS, 527 byte-level host scenarios with fatal ASan/UBSan, 24 ADT ownership/bounds cases, complete real-header Mach-O compilation; includes startup/NOP, narrow pre-HCE clearing, deferred boundary output and bounded TUR reset-UA retry |
+| Ordered patch reconstruction | PASS: TUR reset-UA correction four-stage / 281-patch reconstruction, 6369 files and complete pre-1138 baseline exact; fresh CI profile reconstructs all 6374 files with six dxb substitutions and nine reviewed header copies; two documented dxb skips |
 | Full XNU26 CI build | PASS, correction e1458e3 / 41122349335 / attempt 1; actual ARM64 Mach-O, all 6374 source hashes, 36 UFS markers, 280 ordered patches, Intel host and Xcode 26.1.1 verified |
 | Full hardware payload host loading | PASS, production C loader/FDT/inflater; 43778048 loaded bytes match the Python reference, including dirty BSS/boot_args destinations |
 | Final Samsung image | PASS, exact loader/payload sections, preserved template metadata/DTBH/footer and independently verified SHA-1/SHA256 |
@@ -1602,9 +1606,62 @@ Use the existing **TWRP / OrangeFox** Samsung boot-image procedure. Send a compl
 held-output photograph, especially **pre-enable / pre-HCE-clear**, UIC/warm-link,
 NOP, capacity/GPT/read CRC and final counters, or the last visible line.
 
-Physical clearing, startup/NOP/TUR, descriptor/response/data DMA,
-capacity/GPT/repeated userdata reads and root mount remain unverified; no agent
-phone operation occurred.
+The subsequent photograph confirms clean **pre-HCE-clear**, successful
+LINKSTARTUP and **NOP IN result 0**. TUR then reports
+**OCS7 / UPIU21 / response1 / status2 / sense06/29/00**, followed by
+**FAILED (5), writes0, commands failed1**. The image association follows the
+delivery; its installed checksum and raw sense format/length were not measured.
+The original photograph and qualified observation are preserved in ignored
+`research/starlte/tur-reset-bringup/`. Capacity/GPT/repeated userdata reads and
+root mount remain unverified.
+
+#### TUR reset-UA correction delivery
+
+Source **db22b20**, [Intel CI **41134708958**](https://github.com/friendlycatt/Bergamota/actions/runs/41134708958),
+attempt 1. Samsung's [pinned response handler][samsung-ufshcd] decodes SCSI
+responses for OCS_FATAL_ERROR. Patch 1138 permits one reset-UA retry per LUN
+only for a validated no-data TUR after NOP and a fresh clean host/list/UIC
+sample. A persistent reset notification still quarantines transport.
+
+The separately packaged image is:
+
+```text
+/home/friendlycatt/Bergamota/research/starlte/ufs-link-startup-work/enxerto/out/starlte/boot-starlte-ufs-tur-reset.img
+```
+
+**10463248 bytes**, adjacent **`.img.sha256`**. SHA256:
+
+```text
+322f93fbdf32fe2faa7e44e3bf443142c1b9c69668080f8f12cbc1dddcdb5b24
+```
+
+All **6374 actual CI source hashes** match the pre-download inventory, including
+the complete pre-1138 baseline. The ARM64 kernel is **22213976 bytes**,
+SHA256 **`9b5dd69a9951868674e34554c1389bdd42ea461e6989cf2149bf2ebaa0df29cc`**.
+Packaging passes **22:46:37Z**; independent raw audit passes **22:46:59Z**.
+The production host loader compares **43778048 RAM bytes exact**; the raw audit
+verifies every loaded CI segment, UniPro/opt-in configuration and supplied
+Samsung template metadata, DTBH/footer and legacy SHA-1.
+
+A fresh 90-second QEMU capture ran in
+`research/starlte/tur-reset-qemu-41134708958/`, short socket alias
+`/tmp/opencode/utr-41134708958`: **7078 console bytes / 6942 IRQs and one
+verified retried Skywalk demand fault / rootvnode=early_panicking=0**. The actual
+screenshot was viewed: readable missing-node **FAILED (6), writes 0, commands
+failed 0 / PROBE HOLD**; runner **3 / `blank_screen`** is the known
+colored-console decoder limitation. Independent QEMU audit passes with the
+unchanged **`irq-or-one-retried-skywalk-demand-fault-v1`** /
+**`idle-or-verified-gicv2-timer-ack-v2`** policies; QEMU has no Samsung UFS.
+
+Finalization passes **07:50:33Z**. The first final-verification attempt then
+exited **1** only because `/tmp/opencode` had been cleared by a system restart,
+removing the QEMU socket alias; that command, log and failed record are retained
+unchanged. After restoring the alias, the distinct-label retry through the same
+pinned predecessor algorithm passes **07:53:00Z**. The bundle
+`research/starlte/tur-reset-delivery/` holds the image, final receipt/README,
+checks, ten reproduction scripts and a verified **64-entry `SHA256SUMS`**,
+manifest SHA256 **`8da76955cfac981852c9624e26c47dc3b4e8eda7cb2f264c17d577b60dc79f07`**.
+Evidence is under `research/starlte/tur-reset-bringup/`.
 
 ## Getting-started guide review for S9
 
@@ -1614,7 +1671,7 @@ For this checkout and phone:
 | Guide step | S9 / iOS26 equivalent |
 | --- | --- |
 | 0: Qualcomm appended DTBs | The supplied Samsung template has a separate DTBH section. Use the [Samsung packager](#samsung-bootimg-from-a-template). |
-| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1137, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics, **41014066730** predates pre-submit boundaries, **41092452347** predates pre-HCE clearing. |
+| 1: XNU11215 on `ry-diffusion/Bergamota` | XNU12377, patches 1131–1138, fork `friendlycatt/Bergamota`; dispatch with `macos_version=26.5`. Run **40826795487** predates UFS, **40931557218** predates the enable correction, **40955206538** predates pre-cleanup diagnostics, **41014066730** predates pre-submit boundaries, **41092452347** predates pre-HCE clearing, **41122349335** predates the TUR reset-UA retry, **41134708958** is the current TUR reset-UA image. |
 | 2: iPhone X identity and beryllium hardware | `tools/mkadt.py --board starlte --identity n104ap`; the current Apple profile is N104/iPhone 11. |
 | 2b: Adreno 630 firmware | S9 Exynos uses Mali; the Qualcomm firmware/GPU path does not apply. |
 | 3 / 3b / 3c: Renegade root and prebuilt tools | Relevant root-preparation workflow, using `RENEGADE_TARGET=ios26`; prebuilt user tools do not add Samsung kernel drivers. |
@@ -1671,15 +1728,14 @@ new UFS probe above.
 ## Next milestones
 
 1. **Read-only Samsung storage.** Test the finalized
-   [pre-HCE correction image](#pre-hce-correction-delivery) through the existing
+   [TUR reset-UA correction image](#tur-reset-ua-correction-delivery) through the existing
    TWRP / OrangeFox procedure. Keep all transfer checks strict. Obtain actual LUN
    capacity/GPT and repeated userdata reads before preparing the iOS26 root.
    A destructive userdata operation needs separate confirmation; no GPT changes.
-2. **Extend the physical XNU record.** Probe 3's photograph and source review
-   are complete: PA `0x80000010 -> 0`, pending DBR and initializer OCS before
-   cleanup, then failure hold. The new candidate photograph stops at pre-enable
-   with zero failed submitted commands. Photograph replacement startup/NOP results, boundary samples,
-   any first-error/terminal samples, counters and hold (or last visible line).
+2. **Extend the physical XNU record.** The latest photograph confirms clean
+   pre-HCE-clear, LINKSTARTUP and NOP, then the reset-UA TUR failure. Photograph
+   the `TUR-reset-UA` record, bounded retry/result, capacity/GPT/read CRC,
+   counters and hold (or the last visible line).
 3. **Timer and CPU delivery.** Validate CNTV/INTID27 on hardware, then
    CPU_ON/IPIs on the real affinities. The ADT supplies 26 MHz despite the
    observed zero `CNTFRQ_EL0` register.
